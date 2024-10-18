@@ -1,5 +1,8 @@
 import "dotenv/config"
 import "reflect-metadata"
+import tsConfig from './package.json'
+import { register } from 'tsconfig-paths'
+register({ baseUrl: __dirname, paths: tsConfig.paths })
 import { bootstrap } from "./src/application";
 function main() {
     const app = bootstrap.AppServer.InitailizeApplication()!

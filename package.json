@@ -1,12 +1,26 @@
 {
-  "name": "backend",
+  "name": "terminus-web-backend",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "./build/main.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsc -p .",
+    "start": "node ./build/main.js",
+    "dev": "nodemon main.ts"
   },
   "keywords": [],
-  "author": "",
+  "author": {
+    "name": "Mullayam",
+    "email": "mullayam06@outlook.com"
+  },
+  "paths":{
+    "@/*": ["./src/*"],
+    "@app/*": ["./src/app/*"],
+    "@handlers/*": ["./src/handlers/*"],     
+    "@middlewares/*": ["./src/middlewares/*"],   
+    "@services/*": ["./src/services/*"],
+    "@utils/*": ["./src/utils/*"],
+    "@types/*": ["./src/utils/types/*"]    
+  },
   "license": "ISC",
   "description": "",
   "dependencies": {
@@ -34,6 +48,7 @@
     "socket.io": "^4.8.0",
     "ssh2": "^1.16.0",
     "ssh2-sftp-client": "^11.0.0",
+    "tsconfig-paths": "^4.2.0",
     "util": "^0.12.5",
     "validator": "^13.12.0"
   }

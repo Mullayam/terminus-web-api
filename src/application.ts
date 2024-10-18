@@ -11,14 +11,15 @@ import { InitSocketConnection } from './services/socket';
 import { RouteResolver } from '@enjoys/express-utils/routes-resolver';
 import express, { Application, NextFunction, Response, Request } from 'express'
 import fileUpload from 'express-fileupload';
-const { ExceptionHandler ,UnhandledRoutes} = createHandlers();
+import ApiRoutes from './routes/web'
+const { ExceptionHandler, UnhandledRoutes } = createHandlers();
 
 class AppServer {
     static App: Application = express();
     static PORT: number = +7145;
 
     constructor() {
-        this.ApplyConfiguration();   
+        this.ApplyConfiguration();
         this.RegisterRoutes();
         this.ExceptionHandler();
         this.GracefulShutdown()
@@ -40,18 +41,19 @@ class AppServer {
             origin: ["*"],
             optionsSuccessStatus: 200,
             methods: ["GET", "POST", "PUT", "DELETE"],
-            allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization","Sessionid"],
+            allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization", "Sessionid"],
             credentials: true
         }));
         AppServer.App.use(bodyParser.json());
         AppServer.App.use(fileUpload());
         AppServer.App.use(bodyParser.urlencoded({ extended: false }));
     }
-    private RegisterRoutes(){
+    private RegisterRoutes() {
         Logging.dev("Registering Routes")
-        RouteResolver.Mapper(AppServer.App)
         Logging.dev("Routes Registered")
+        AppServer.App.use(ApiRoutes);
         AppServer.App.use(UnhandledRoutes);
+        RouteResolver.Mapper(AppServer.App, { listEndpoints: true, })
     }
     /**
         * ExceptionHandler function.
