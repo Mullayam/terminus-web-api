@@ -27,7 +27,7 @@ export class SocketListener {
                 socket.emit(SocketEventConstants.SSH_READY, 'Connected to SSH server\n');
                 Sftp_Service.connectSFTP({ host, username, ...sshOptions })
                 // const { term, cols, rows } = socket.request.session.ssh;
-                conn.shell({ cols: 80, rows: 24, term: 'xterm-256color' }, function (err, stream) {
+                conn.shell({ cols: 130, rows: 30, term: 'xterm-256color' }, function (err, stream) {
                     if (err) {
                         socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'Error opening shell: ' + err.message);
                         return;
@@ -141,18 +141,39 @@ export class SocketListener {
             if (!dirPath) return socket.emit(SocketEventConstants.ERROR, 'Invalid directory path');
 
             try {
-                const files = await sftp.list(dirPath);
-                socket.emit(SocketEventConstants.SFTP_FILES_LIST, files);
+                const currentDir = await sftp.cwd()
+                const files = await sftp.list(currentDir)
+
+                socket.emit(SocketEventConstants.SFTP_FILES_LIST, {
+                    files, currentDir
+                });
             } catch (err) {
                 socket.emit(SocketEventConstants.ERROR, 'Error fetching files');
                 console.error(err);
             }
         });
+        // File Properties
+        socket.on(SocketEventConstants.SFTP_EXISTS, async (payload: FileOperationPayload): Promise<any> => {
+            const { dirPath } = payload;
+            if (!dirPath) return socket.emit(SocketEventConstants.ERROR, 'Invalid directory path');
 
+            try {
+                const isExists = await sftp.exists(dirPath)
+
+                if (!isExists) {
+                    socket.emit(SocketEventConstants.ERROR, 'File not found');
+                    return
+                }
+                socket.emit(SocketEventConstants.SFTP_FILES_LIST, isExists);
+            } catch (err) {
+                socket.emit(SocketEventConstants.ERROR, 'Error fetching files');
+                console.error(err);
+            }
+        });
         // Rename a file
         socket.on(SocketEventConstants.SFTP_RENAME_FILE, async (payload: FileOperationPayload): Promise<any> => {
             const { oldPath, newPath } = payload;
-            if (!oldPath || !newPath) return socket.emit('error', 'Invalid file paths');
+            if (!oldPath || !newPath) return socket.emit(SocketEventConstants.ERROR, 'Invalid file paths');
 
             try {
                 await sftp.rename(oldPath, newPath);
@@ -166,7 +187,7 @@ export class SocketListener {
         // Move a file (SFTP does not have a direct move, so we use rename)
         socket.on(SocketEventConstants.SFTP_MOVE_FILE, async (payload: FileOperationPayload): Promise<any> => {
             const { oldPath, newPath } = payload;
-            if (!oldPath || !newPath) return socket.emit('error', 'Invalid file paths');
+            if (!oldPath || !newPath) return socket.emit(SocketEventConstants.ERROR, 'Invalid file paths');
 
             try {
                 await sftp.rename(oldPath, newPath);
@@ -180,7 +201,7 @@ export class SocketListener {
         // Create new file
         socket.on(SocketEventConstants.SFTP_CREATE_FILE, async (payload: FileOperationPayload): Promise<any> => {
             const { filePath } = payload;
-            if (!filePath) return socket.emit('error', 'Invalid file path');
+            if (!filePath) return socket.emit(SocketEventConstants.ERROR, 'Invalid file path');
 
             try {
                 await sftp.put(Buffer.from(''), filePath); // Create an empty file

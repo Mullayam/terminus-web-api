@@ -22,6 +22,8 @@ export enum SocketEventConstants {
     SFTP_COPY_FILE = "@@SFTP_COPY_FILE",
     SFTP_CREATE_FILE = "@@SFTP_CREATE_FILE",
     SFTP_CREATE_DIR = "@@SFTP_CREATE_DIR",
+    SFTP_EXISTS = "@@SFTP_EXISTS",
+     
 
     SUCCESS = "@@SUCCESS",
     ERROR = "@@ERROR"

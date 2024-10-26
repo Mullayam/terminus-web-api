@@ -1,0 +1,55 @@
+{
+    "name": "terminus-web-backend",
+    "version": "1.0.0",
+    "main": "./build/main.js",
+    "scripts": {
+        "build": "tsc -p .",
+        "start": "node ./build/main.js",
+        "dev": "nodemon main.ts"
+    },
+    "keywords": [],
+    "author": {
+        "name": "Mullayam",
+        "email": "mullayam06@outlook.com"
+    },
+    "paths": {
+        "@/*": ["./src/*"],
+        "@app/*": ["./src/app/*"],
+        "@handlers/*": ["./src/handlers/*"],
+        "@middlewares/*": ["./src/middlewares/*"],
+        "@services/*": ["./src/services/*"],
+        "@utils/*": ["./src/utils/*"],
+        "@types/*": ["./src/utils/types/*"]
+    },
+    "license": "ISC",
+    "description": "",
+    "dependencies": {
+        "@enjoys/exception": "^1.1.2",
+        "@enjoys/express-utils": "^2.0.1",
+        "@types/cidr-matcher": "^2.1.2",
+        "@types/cookie-parser": "^1.4.7",
+        "@types/express": "^5.0.0",
+        "@types/express-fileupload": "^1.5.1",
+        "@types/morgan": "^1.9.9",
+        "@types/ssh2": "^1.15.1",
+        "@types/ssh2-sftp-client": "^9.0.4",
+        "@types/validator": "^13.12.2",
+        "cidr-matcher": "^2.1.1",
+        "cookie-parser": "^1.4.7",
+        "cors": "^2.8.5",
+        "dotenv": "^16.4.5",
+        "express": "^4.21.1",
+        "express-fileupload": "^1.5.1",
+        "from": "^0.1.7",
+        "helmet": "^8.0.0",
+        "import": "^0.0.6",
+        "morgan": "^1.10.0",
+        "reflect-metadata": "^0.2.2",
+        "socket.io": "^4.8.0",
+        "ssh2": "^1.16.0",
+        "ssh2-sftp-client": "^11.0.0",
+        "tsconfig-paths": "^4.2.0",
+        "util": "^0.12.5",
+        "validator": "^13.12.0"
+    }
+}

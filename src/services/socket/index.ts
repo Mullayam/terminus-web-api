@@ -21,8 +21,8 @@ export const InitSocketConnection = (server: HttpServer) => {
   io.on('connection', (socket) => {
     listner.onConnection(socket)
     listner.sftpOperation(socket)
-  })  
- 
+  })
+
   socketIo = io
   return io
 };
