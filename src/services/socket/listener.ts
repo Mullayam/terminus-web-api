@@ -12,7 +12,7 @@ import { Sftp_Service } from '../sftp';
 const sftp = Sftp_Service.getSftpInstance()
 const localStore = new Map<string, any>();
 export class SocketListener {
-
+    private currentPath = '';
     public onConnection(socket: Socket) {
 
         console.log("Client connected: " + socket.id);
@@ -137,15 +137,16 @@ export class SocketListener {
     sftpOperation(socket: Socket) {
         // Get files
         socket.on(SocketEventConstants.SFTP_GET_FILE, async (payload: FileOperationPayload): Promise<any> => {
-            const { dirPath } = payload;
-            if (!dirPath) return socket.emit(SocketEventConstants.ERROR, 'Invalid directory path');
-
             try {
-                const currentDir = await sftp.cwd()
-                const files = await sftp.list(currentDir)
 
+                let dirPath: string | undefined = payload?.dirPath
+                if (!payload || !payload?.dirPath) {
+                    dirPath = await sftp.cwd() as string
+                }
+                this.currentPath = dirPath!
+                const files = await sftp.list(dirPath!)
                 socket.emit(SocketEventConstants.SFTP_FILES_LIST, {
-                    files, currentDir
+                    files, currentDir: dirPath
                 });
             } catch (err) {
                 socket.emit(SocketEventConstants.ERROR, 'Error fetching files');

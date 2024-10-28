@@ -12,6 +12,7 @@ import { RouteResolver } from '@enjoys/express-utils/routes-resolver';
 import express, { Application, NextFunction, Response, Request } from 'express'
 import fileUpload from 'express-fileupload';
 import ApiRoutes from './routes/web'
+import { ApplyMiddleware } from './middlewares/all.middlewares';
 const { ExceptionHandler, UnhandledRoutes } = createHandlers();
 
 class AppServer {
@@ -19,6 +20,7 @@ class AppServer {
     static PORT: number = +7145;
 
     constructor() {
+        AppServer.App.use(ApplyMiddleware("setHeaders"));
         this.ApplyConfiguration();
         this.RegisterRoutes();
         this.ExceptionHandler();

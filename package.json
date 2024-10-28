@@ -5,7 +5,7 @@
   "scripts": {
     "build": "tsc -p .",
     "start": "node ./build/main.js",
-    "dev": "nodemon main.ts"
+    "dev": "npx nodemon main.ts"
   },
   "keywords": [],
   "author": {
