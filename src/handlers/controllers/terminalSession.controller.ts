@@ -3,6 +3,8 @@ import type { Response, Request } from 'express'
 class TerminalSessionController { 
     async create (req: Request, res: Response) {
         try {
+            let sessionId = '';
+
             res.json({
                 status: true,
                 message: '',

@@ -13,6 +13,7 @@ import express, { Application, NextFunction, Response, Request } from 'express'
 import fileUpload from 'express-fileupload';
 import ApiRoutes from './routes/web'
 import { ApplyMiddleware } from './middlewares/all.middlewares';
+
 const { ExceptionHandler, UnhandledRoutes } = createHandlers();
 
 class AppServer {
@@ -48,6 +49,7 @@ class AppServer {
         }));
         AppServer.App.use(bodyParser.json());
         AppServer.App.use(fileUpload());
+        AppServer.App.set('timeout', 0)
         AppServer.App.use(bodyParser.urlencoded({ extended: false }));
     }
     private RegisterRoutes() {

@@ -4,6 +4,7 @@ import { Logging } from '@enjoys/express-utils/logger';
 import { SocketListener } from "./listener";
 let socketIo: Server<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, any>;
 
+
 const listner = new SocketListener()
 export const InitSocketConnection = (server: HttpServer) => {
   Logging.dev("Socket are Initialized")
@@ -19,8 +20,7 @@ export const InitSocketConnection = (server: HttpServer) => {
   // })
 
   io.on('connection', (socket) => {
-    listner.onConnection(socket)
-    listner.sftpOperation(socket)
+    listner.onConnection(socket)   
   })
 
   socketIo = io
