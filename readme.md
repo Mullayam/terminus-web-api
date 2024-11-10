@@ -94,18 +94,12 @@ PORT=7145
 NODE_ENV=development
 
 # Database
-REDIS_URL=redis://localhost:6379
+REDIS_URL=""
 
 # Security
 JWT_SECRET=your_jwt_secret
 ENCRYPTION_KEY=your_encryption_key
-
-# AI Service
-AI_SERVICE_URL=http://localhost:5000
-AI_API_KEY=your_ai_api_key
-
-# WebSocket
-WS_PORT=7145
+FRONTEND_URL=http://localhost:5173
 ```
 
 ## 🔐 Security Considerations

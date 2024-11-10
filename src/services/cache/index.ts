@@ -1,3 +1,4 @@
+import { __CONFIG__ } from "@/utils/constant";
 import { Logging } from "@enjoys/express-utils/logger";
 import { createClient, RedisClientType } from "redis";
 
@@ -6,7 +7,7 @@ class CacheService {
     public cache: RedisClientType
     constructor() {
         Logging.dev("Redis Cache Enabled")
-        this.cache = createClient({ url: 'rediss://default:AVNS_zI0FrxTBvcV5UqgQnBO@redis-39ff04df-mullayam06.a.aivencloud.com:20348' })
+        this.cache = createClient({ url: __CONFIG__.REDIS_URL })
         this.ConnectRedisClient()
         this.cache = this.cache
         this.cache.publish('test', 'test')
