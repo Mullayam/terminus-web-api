@@ -9,16 +9,31 @@ import { SocketEventConstants } from './events';
 import { Logging } from '@enjoys/express-utils/logger';
 import { FileOperationPayload } from '../../types/file-upload';
 import { Sftp_Service } from '../sftp';
-
 import utils from '@/utils';
 import terminalService from '@/handlers/providers/terminalService';
+import { publisher, subscriber } from '../cache';
 const sftp = Sftp_Service.getSftpInstance()
+interface SshSession {
+    client: Client;
+    write: (input: string) => void;
+}
+const sessions: {
+    [key: string]: {
+        uid: string,
+        sessionId: string,
+    }
+} = {};
 
-const sessions: { [key: string]: Client } = {};
-const hosts = new Map<string, any>();
-const localStore = new Map<string, any>();
+let TerminalSize = {
+    width: 0,
+    height: 0,
+    cols: 150,
+    rows: 40
+}
 export class SocketListener {
     private currentPath = '';
+    private sessions: Map<string, SshSession> = new Map();
+    private sessionCommands: Map<string, string> = new Map();
 
     public onConnection(socket: Socket) {
         console.log("User connected: " + socket.id);
@@ -35,72 +50,122 @@ export class SocketListener {
         socket.on('disconnect', () => {
             socket.emit(SocketEventConstants.SSH_DISCONNECTED);
             delete sessions[socket.id];
-            localStore.delete(socket.id);
             sftp.end();
             console.log('User disconnected');
         });
     }
     private hanndleMultipleSession(socket: Socket) {
         let sessionId = '';
-        socket.on(SocketEventConstants.CreateTerminal, async (data) => {
+        // Generate a unique user ID for each connection
+        let uid = utils.uuid_v4();
+        socket.on(SocketEventConstants.CreateTerminal, async (data: {
+            config: {
+                password: any;
+                privateKey?: undefined;
+                host: any;
+                username: any;
+            } | {
+                privateKey: any;
+                password?: undefined;
+                host: any;
+                username: any;
+            }
+            permissions: { read: boolean, write: boolean }
+        }) => {
             try {
+                data = typeof data === 'string' ? (data = JSON.parse(data)) : data;
+                // Generate a unique Session ID for each connection
                 sessionId = utils.uuid_v4();
-                const sshConfig = localStore.get(socket.id) as ReturnType<typeof this.sshConfig>;
-                hosts.set(sessionId, sshConfig);
+                // Get the SSH configuration from Current Login Session User
+                const sshConfig = data.config
+                sessions[socket.id] = { uid, sessionId };
+                // Store the SSH configuration in a map
+                // Create a new SSH session
                 await terminalService.createSshSession(sessionId, sshConfig);
-
-                socket.emit(SocketEventConstants.TerminalUrl, sessionId);
-
+                // Set permissions for the user                
+                terminalService.setPermissions(sessionId, uid, data.permissions);
+                // Emit the session ID to the client for sharing
+                socket.emit(SocketEventConstants.TerminalUrl, { uid, sessionId });
+                // Emit the permissions to the client
+                socket.emit(SocketEventConstants.SSH_PERMISSIONS, data.permissions);
+                // Subscribe to the session
                 terminalService.subscribeToSession(sessionId, (data: string) => {
-                    socket.emit(SocketEventConstants.SSH_EMIT_DATA, data);
+                    socket.emit(SocketEventConstants.terminal_output, data);
                 });
             } catch (error) {
                 socket.emit(SocketEventConstants.Error, error);
                 Logging.dev('Failed to create SSH session:' + error, "error");
             }
         });
+        socket.on(SocketEventConstants.SSH_PERMISSIONS, ({ uid, permissions, sessionId }) => {
+            terminalService.setPermissions(sessionId, uid, permissions);
+            socket.emit("updatedPermissions", permissions);
 
-        socket.on(SocketEventConstants.SSH_EMIT_INPUT, (input: string) => {
+        });
+        socket.on(SocketEventConstants.terminal_input, async (input: string) => {
             terminalService.handleInput(sessionId, input);
         });
 
         socket.on(SocketEventConstants.join_terminal, (joinSessionId: string) => {
             sessionId = joinSessionId;
             terminalService.subscribeToSession(sessionId, (data: string) => {
-                socket.emit(SocketEventConstants.SSH_EMIT_DATA, data);
+                socket.emit(SocketEventConstants.terminal_output, data);
             });
         });
         socket.on('disconnecting', () => {
             socket.emit(SocketEventConstants.SESSIONN_END);
         });
-        socket.on('disconnect', () => {
-            delete sessions[socket.id]
+        socket.on('disconnect', async () => {
+            const session = await this.getSessionStore(socket.id)
+            if (session) {
+                terminalService.unSubscribeToSession(session.sessionId, (data: string) => {
+                    socket.emit(SocketEventConstants.SUCCESS, "Session Disconnected");
+                })
+                delete sessions[socket.id]
+            }
             console.log('Client disconnected');
         });
+    }
+    private async getSessionStore(uid: string) {
+        return sessions[uid];
     }
     private sshOperation(socket: Socket) {
         let conn: Client = new Client();
         const _this = this;
         socket.on(SocketEventConstants.SSH_CONNECT, function (data) {
-            const { host, username, sshOptions } = _this.sshConfig(data);
-            localStore.set(socket.id, { host, username, sshOptions });
+
+            const userData = { uid: Math.random().toString(36).slice(2), sessionId: utils.uuid_v4() }
+            sessions[socket.id] = userData;
+            const { host, username, ...sshOptions } = _this.sshConfig(data);
             conn.on('ready', function () {
-                socket.emit(SocketEventConstants.SSH_READY, 'Connected to SSH server\n');
+                socket.emit(SocketEventConstants.SSH_READY, userData);
                 Sftp_Service.connectSFTP({ host, username, ...sshOptions })
-                conn.shell({ cols: 130, rows: 30, term: 'xterm-256color' }, function (err, stream) {
+
+                conn.shell({ cols: TerminalSize.cols, rows: TerminalSize.rows, term: 'xterm-256color' }, function (err, stream) {
                     if (err) {
+                        delete sessions[socket.id]
                         socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'Error opening shell: ' + err.message);
                         return;
                     }
+                    const sshSession: SshSession = {
+                        client: conn,
+                        write: (input: string) => stream.write(input),
+                    };
+                    _this.sessions.set(userData.sessionId, sshSession);
+
                     // Stream SSH output to the client
                     stream.on('data', function (data: any) {
-                        socket.emit(SocketEventConstants.SSH_EMIT_DATA, data.toString('utf-8'));
+                        const sessionId = sessions[socket.id].sessionId                        
+                        socket.emit(SocketEventConstants.SSH_EMIT_DATA, { sessionId, input: data.toString('utf-8') });
                     });
                     socket.on(SocketEventConstants.SSH_EMIT_RESIZE, (data) => {
-                        stream.setWindow(data.rows, data.cols, data.height, data.width);
+                        TerminalSize.cols = data.cols
+                        TerminalSize.rows = data.rows
+                        stream.setWindow(data.rows, data.cols, 1280, 720);
                     });
                     // Listen for terminal input from client
-                    socket.on(SocketEventConstants.SSH_EMIT_INPUT, function (input) {
+                    socket.on(SocketEventConstants.SSH_EMIT_INPUT, function ({ sessionId, input }) {                      
+                        _this.sessionCommands.set(socket.id, sessionId)
                         stream.write(input);
                     });
                     stream.on('close', function () {
@@ -150,6 +215,8 @@ export class SocketListener {
                     socket.emit('title', `ssh://`);
                 })
             socket.on('disconnect', () => {
+                delete sessions[socket.id]
+
                 conn.end();
             });
         });
@@ -165,9 +232,9 @@ export class SocketListener {
                 }
                 this.currentPath = dirPath!
                 const files = await sftp.list(dirPath!)
-                socket.emit(SocketEventConstants.SFTP_FILES_LIST, {
-                    files, currentDir: dirPath
-                });
+                // socket.emit(SocketEventConstants.SFTP_FILES_LIST, {
+                //     files:JSON.stringify(files), currentDir: dirPath
+                // });
             } catch (err) {
                 socket.emit(SocketEventConstants.ERROR, 'Error fetching files');
                 console.error(err);
@@ -303,11 +370,6 @@ export class SocketListener {
     }
     private connectSFTP(socket: Socket) {
         socket.on(SocketEventConstants.SFTP_CONNECT, (data: any) => {
-            if (!data) {
-                const { host, username, ...sshOptions } = this.sshConfig(localStore.get(socket.id));
-                Sftp_Service.connectSFTP({ host, username, ...sshOptions })
-                return
-            }
             const { host, username, ...sshOptions } = this.sshConfig(data);
             Sftp_Service.connectSFTP({ host, username, ...sshOptions })
         })
@@ -315,16 +377,20 @@ export class SocketListener {
     private sshConfig(data: any) {
         if (typeof data === 'string') {
             data = JSON.parse(data);
+            const sshOptions = data.authMethod === 'password' ? { password: data.password } : { privateKey: data.privateKeyText }
+
             return {
                 host: data.host,
                 username: data.username,
-                sshOptions: data.authMethod === 'password' ? { password: data.password } : { privateKey: data.privateKeyText }
+                ...sshOptions
             }
         }
+        const sshOptions = data.authMethod === 'password' ? { password: data.password } : { privateKey: data.privateKeyText }
+
         return {
             host: data.host,
             username: data.username,
-            sshOptions: data.authMethod === 'password' ? { password: data.password } : { privateKey: data.privateKeyText }
+            ...sshOptions
         }
     }
 }

@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { Authentication, TerminalSession, SFTP, KeyVault } from '@/handlers/ctrl';
+import { Authentication, TerminalSession, SFTP } from '@/handlers/ctrl';
 
 const router = Router();
 // Authentication
@@ -17,11 +17,7 @@ router.delete('/sessions/:id', TerminalSession.default.deleteSession);
 router.post('/upload', SFTP.default.handleUpload);
 router.post('/download', SFTP.default.handleDownload);
 
-// Key Management
-router.post('/keys/create', KeyVault.default.create);
-router.get('/keys/list ', KeyVault.default.list);
-router.put('/keys/update ', KeyVault.default.update);
-router.delete('/api/keys/delete ', KeyVault.default.delete);
+ 
 
 
 

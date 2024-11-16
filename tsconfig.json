@@ -19,6 +19,7 @@
     "resolveJsonModule": true,
     "outDir": "./build",
     "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
     "forceConsistentCasingInFileNames": true,
     "strict": true,
     "skipLibCheck": true
