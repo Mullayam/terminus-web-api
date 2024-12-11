@@ -5,7 +5,6 @@ const sftp = new SFTPClient();
  class SFTP_Service{
      connectSFTP = async (options: SFTPClient.ConnectOptions): Promise<void> => {
         try {
-           
             await sftp.connect(options);
             Logging.dev('Connected to SFTP server');
         } catch (err) {

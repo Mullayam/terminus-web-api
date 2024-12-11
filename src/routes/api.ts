@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { Authentication, TerminalSession, SFTP } from '@/handlers/ctrl';
 
+
 const router = Router();
 // Authentication
 router.get('/login', Authentication.default.login);
@@ -17,7 +18,7 @@ router.delete('/sessions/:id', TerminalSession.default.deleteSession);
 router.post('/upload', SFTP.default.handleUpload);
 router.post('/download', SFTP.default.handleDownload);
 
- 
+
 
 
 

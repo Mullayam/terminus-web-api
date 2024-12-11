@@ -1,3 +1,6 @@
+import fs from 'fs';
+import path, { join } from 'path';
+import AdmZip from 'adm-zip';
 import util from 'util'
 import SSH, { Client, ParsedKey } from 'ssh2';
 import validator from 'validator';
@@ -12,10 +15,17 @@ import { Sftp_Service } from '../sftp';
 import utils from '@/utils';
 import terminalService from '@/handlers/providers/terminalService';
 import { publisher, subscriber } from '../cache';
+
 const sftp = Sftp_Service.getSftpInstance()
+
 interface SshSession {
     client: Client;
     write: (input: string) => void;
+}
+
+interface SSHInstance {
+    sshClient: Client;
+    sessionId: string;
 }
 const sessions: {
     [key: string]: {
@@ -23,7 +33,7 @@ const sessions: {
         sessionId: string,
     }
 } = {};
-
+const sshInstances: Record<string, SSHInstance> = {};
 let TerminalSize = {
     width: 0,
     height: 0,
@@ -49,15 +59,15 @@ export class SocketListener {
         socket.on('disconnecting', (reason) => { Logging.dev(`SOCKET DISCONNECTING: ${reason}`); });
         socket.on('disconnect', () => {
             socket.emit(SocketEventConstants.SSH_DISCONNECTED);
-            delete sessions[socket.id];
             sftp.end();
             console.log('User disconnected');
         });
     }
+  
     private hanndleMultipleSession(socket: Socket) {
         let sessionId = '';
         // Generate a unique user ID for each connection
-        let uid = utils.uuid_v4();
+        let uid = Math.random().toString(36).slice(2);
         socket.on(SocketEventConstants.CreateTerminal, async (data: {
             config: {
                 password: any;
@@ -129,34 +139,29 @@ export class SocketListener {
     private async getSessionStore(uid: string) {
         return sessions[uid];
     }
-    private sshOperation(socket: Socket) {
-        let conn: Client = new Client();
+    private sshOperation2(socket: Socket) {
+        let conn: Client = new Client({ captureRejections: true });
         const _this = this;
         socket.on(SocketEventConstants.SSH_CONNECT, function (data) {
-
             const userData = { uid: Math.random().toString(36).slice(2), sessionId: utils.uuid_v4() }
-            sessions[socket.id] = userData;
+
             const { host, username, ...sshOptions } = _this.sshConfig(data);
             conn.on('ready', function () {
                 socket.emit(SocketEventConstants.SSH_READY, userData);
-                Sftp_Service.connectSFTP({ host, username, ...sshOptions })
+                Sftp_Service.connectSFTP({ host, username, ...sshOptions }).then(() => {
+                    socket.emit(SocketEventConstants.SFTP_READY, true);
+                })
 
                 conn.shell({ cols: TerminalSize.cols, rows: TerminalSize.rows, term: 'xterm-256color' }, function (err, stream) {
                     if (err) {
-                        delete sessions[socket.id]
+
                         socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'Error opening shell: ' + err.message);
                         return;
                     }
-                    const sshSession: SshSession = {
-                        client: conn,
-                        write: (input: string) => stream.write(input),
-                    };
-                    _this.sessions.set(userData.sessionId, sshSession);
 
                     // Stream SSH output to the client
                     stream.on('data', function (data: any) {
-                        const sessionId = sessions[socket.id].sessionId                        
-                        socket.emit(SocketEventConstants.SSH_EMIT_DATA, { sessionId, input: data.toString('utf-8') });
+                        socket.emit(SocketEventConstants.SSH_EMIT_DATA, data.toString('utf-8'));
                     });
                     socket.on(SocketEventConstants.SSH_EMIT_RESIZE, (data) => {
                         TerminalSize.cols = data.cols
@@ -164,8 +169,7 @@ export class SocketListener {
                         stream.setWindow(data.rows, data.cols, 1280, 720);
                     });
                     // Listen for terminal input from client
-                    socket.on(SocketEventConstants.SSH_EMIT_INPUT, function ({ sessionId, input }) {                      
-                        _this.sessionCommands.set(socket.id, sessionId)
+                    socket.on(SocketEventConstants.SSH_EMIT_INPUT, function (input) {
                         stream.write(input);
                     });
                     stream.on('close', function () {
@@ -185,6 +189,8 @@ export class SocketListener {
                     port: 22,
                     username: username,
                     ...sshOptions,
+                    debug: (info) => socket.emit(SocketEventConstants.SSH_EMIT_LOGS, { uid: userData.uid, info })
+
                 });
             conn.on('banner', (data) => {
                 // need to convert to cr/lf for proper formatting
@@ -195,7 +201,7 @@ export class SocketListener {
                     const channel = accept(); // Accept the connection and return a Channel object
                     if (channel) {
                         channel.on("data", (data: any) => {
-                            console.log("Received TCP data: ", data.toString());
+                            socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, data.toString())
                         });
                     }
                     socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, details)
@@ -212,29 +218,159 @@ export class SocketListener {
                     socket.emit(SocketEventConstants.SSH_HOST_KEYS, keys);
                 })
                 .on('handshake', (data: SSH_HANDSHAKE) => {
-                    socket.emit('title', `ssh://`);
+                    socket.emit(SocketEventConstants.SSH_EMIT_LOGS, data)
                 })
             socket.on('disconnect', () => {
-                delete sessions[socket.id]
+                conn.end();
+            });
+        });
+    }
+    private sshOperation(socket: Socket) {
+        let conn: Client = new Client({
+            captureRejections: true
+        });
+        const _this = this;
+        socket.on(SocketEventConstants.SSH_CONNECT, function (data) {
+            const userData = { uid: Math.random().toString(36).slice(2), sessionId: utils.uuid_v4() }
 
+            const { host, username, ...sshOptions } = _this.sshConfig(data);
+            conn.on('ready', function () {
+                socket.emit(SocketEventConstants.SSH_READY, userData);
+                Sftp_Service.connectSFTP({ host, username, ...sshOptions }).then(() => {
+                    socket.emit(SocketEventConstants.SFTP_READY, true);
+                })
+
+                conn.shell({ cols: TerminalSize.cols, rows: TerminalSize.rows, term: 'xterm-256color' }, function (err, stream) {
+                    if (err) {
+
+                        socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'Error opening shell: ' + err.message);
+                        return;
+                    }
+
+                    // Stream SSH output to the client
+                    stream.on('data', function (data: any) {
+                        socket.emit(SocketEventConstants.SSH_EMIT_DATA, data.toString('utf-8'));
+                    });
+                    socket.on(SocketEventConstants.SSH_EMIT_RESIZE, (data) => {
+                        TerminalSize.cols = data.cols
+                        TerminalSize.rows = data.rows
+                        stream.setWindow(data.rows, data.cols, 1280, 720);
+                    });
+                    // Listen for terminal input from client
+                    socket.on(SocketEventConstants.SSH_EMIT_INPUT, function (input) {
+                        stream.write(input);
+                    });
+                    stream.on('close', function () {
+                        conn.end();
+                    });
+                    stream.stderr.on('data', (data) => {
+                        Logging.dev(`STDERR: ${data}`, "error");
+                    });
+                });
+            })
+                .on('error', function (err) {
+                    console.log(err)
+                    socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'SSH connection error: ' + err.message);
+                })
+                .connect({
+                    host: host,
+                    port: 22,
+                    username: username,
+                    ...sshOptions,
+                    debug: (info) => socket.emit(SocketEventConstants.SSH_EMIT_LOGS, { uid: userData.uid, info })
+
+                });
+            conn.on('banner', (data) => {
+                // need to convert to cr/lf for proper formatting
+                socket.emit(SocketEventConstants.SSH_BANNER, data.replace(/\r?\n/g, '\r\n').toString());
+            })
+                .on("tcp connection", (details, accept, reject) => {
+                    console.log("TCP connection request received", details);
+                    const channel = accept(); // Accept the connection and return a Channel object
+                    if (channel) {
+                        channel.on("data", (data: any) => {
+                            socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, data.toString())
+                        });
+                    }
+                    socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, details)
+                })
+                .on("change password", (message, done) => {
+                    console.log("Password change required: ", message);
+                    done("new-password");
+                })
+                .on('keyboard-interactive', (_name, _instructions, _instructionsLang, _prompts, finish) => {
+                    // console.log(_name, _instructions, _instructionsLang, _prompts,)
+                    // finish([socket.request.session.userpassword]);
+                })
+                .on("hostkeys", (keys: ParsedKey[]) => {
+                    socket.emit(SocketEventConstants.SSH_HOST_KEYS, keys);
+                })
+                .on('handshake', (data: SSH_HANDSHAKE) => {
+                    socket.emit(SocketEventConstants.SSH_EMIT_LOGS, data)
+                })
+            socket.on('disconnect', () => {
                 conn.end();
             });
         });
     }
     sftpOperation(socket: Socket) {
         // Get files
+        sftp.on('debug', console.log);
+        sftp.on('upload', (info) => socket.emit(SocketEventConstants.FILE_UPLOADED, info.destination));
+
+        socket.on(SocketEventConstants.SFTP_ZIP_EXTRACT, async (payload: FileOperationPayload): Promise<any> => {
+            try {
+                let dirPath: string | undefined = payload?.dirPath
+                if (!dirPath) {
+                    throw new Error("Invalid directory path");
+                }
+                const localZipPath = join(process.cwd(), "storage");
+                await sftp.get(dirPath, localZipPath);
+                // Step 2: Extract the ZIP file
+                const zip = new AdmZip(localZipPath);
+                const extractDir = join(localZipPath, 'extracted');
+
+                zip.extractAllTo(extractDir, true);
+
+                const extractedFiles = fs.readdirSync(extractDir);
+
+                for (const file of extractedFiles) {
+                    const localFilePath = join(extractDir, file);
+                    const remoteFilePath = join(dirPath, file);
+
+                    const fileStat = fs.statSync(localFilePath);
+                    if (fileStat.isFile()) {
+                        // Upload individual files
+                        await sftp.put(localFilePath, remoteFilePath);
+
+                    } else if (fileStat.isDirectory()) {
+                        // Handle directories if necessary (you may want to create a recursive upload function here)
+                        // For simplicity, assume we skip directories in this example
+                        console.log(`Skipping directory: ${file}`);
+                    }
+                }
+                socket.emit(SocketEventConstants.FILE_UPLOADED, dirPath);
+
+                fs.unlinkSync(localZipPath);
+                fs.rmSync(extractDir, { recursive: true, force: true });
+
+
+            } catch (err: any) {
+                socket.emit(SocketEventConstants.ERROR, err.message);
+                console.error(err);
+            }
+        });
         socket.on(SocketEventConstants.SFTP_GET_FILE, async (payload: FileOperationPayload): Promise<any> => {
             try {
-
                 let dirPath: string | undefined = payload?.dirPath
                 if (!payload || !payload?.dirPath) {
                     dirPath = await sftp.cwd() as string
                 }
                 this.currentPath = dirPath!
                 const files = await sftp.list(dirPath!)
-                // socket.emit(SocketEventConstants.SFTP_FILES_LIST, {
-                //     files:JSON.stringify(files), currentDir: dirPath
-                // });
+                socket.emit(SocketEventConstants.SFTP_FILES_LIST, {
+                    files: JSON.stringify(files), currentDir: dirPath
+                });
             } catch (err) {
                 socket.emit(SocketEventConstants.ERROR, 'Error fetching files');
                 console.error(err);

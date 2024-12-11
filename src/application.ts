@@ -41,14 +41,17 @@ class AppServer {
         AppServer.App.use(morgan("dev"));
         AppServer.App.use(cookieParser());
         AppServer.App.use(cors({
-            origin: ["*"],
+            origin: "*",
             optionsSuccessStatus: 200,
             methods: ["GET", "POST", "PUT", "DELETE"],
             allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization", "Sessionid"],
             credentials: true
         }));
         AppServer.App.use(bodyParser.json());
-        AppServer.App.use(fileUpload());
+        AppServer.App.use(fileUpload({
+            useTempFiles: true,
+            tempFileDir: '/tmp/',
+        }));
         AppServer.App.set('timeout', 0)
         AppServer.App.use(bodyParser.urlencoded({ extended: false }));
     }
