@@ -47,7 +47,6 @@ A secure, real-time terminal collaboration platform enabling shared SFTP session
   - Rate limiting
 
 - **Terminal:**
-  - PTY.js for terminal emulation
   - SSH2 for SFTP operations
   - xterm.js compatibility
 
@@ -113,22 +112,8 @@ FRONTEND_URL=http://localhost:5173
 
 ## 🌐 API Documentation
 
-### Authentication
 
-```bash
-POST /api/auth/login
-POST /api/auth/register
-POST /api/auth/refresh
-```
 
-### Terminal Sessions
-
-```bash
-POST /api/sessions/create
-GET /api/sessions/:id
-PUT /api/sessions/:id/permissions
-DELETE /api/sessions/:id
-```
 
 ### SFTP Operations
 
@@ -137,22 +122,7 @@ POST /api/sftp/upload
 GET /api/sftp/download 
 ```
 
-### Key Management
 
-```bash
-POST /api/keys/create
-GET /api/keys/list
-PUT /api/keys/update
-DELETE /api/keys/delete
-```
-
-## 📊 Monitoring
-
-The platform includes built-in monitoring endpoints:
-
-- `/health` - Service health check
-- `/metrics` - Prometheus-compatible metrics
-- `/status` - System status dashboard
 
 
 ## 🤝 Contributing
@@ -169,16 +139,15 @@ This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md
 
 ## 👥 Authors
 
--  [Mullayam ](https://github.com/Mullayam/terminus-web)- *Initial work* 
--  [Kunal](https://github.com/Mullayam/terminus-web)- *Collaborator-Frontend*  
-- [Shubham Singh](https://github.com/shubhexists) -   *Collaborator-Full Stack*  
+-  [Mullayam ](https://github.com/Mullayam)
+
 
 ## 🙏 Acknowledgments
 
-- PTY.js team for terminal emulation
+
 - Socket.io team for real-time capabilities
 - OpenAI for AI integration support
 
 ## 📞 Support
 
-For support, email mullayam@enjoys.in 
+For support, email mullayam06@outlook.com
