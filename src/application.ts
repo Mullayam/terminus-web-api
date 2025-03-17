@@ -13,7 +13,8 @@ import express, { Application, NextFunction, Response, Request } from 'express'
 import fileUpload from 'express-fileupload';
 import ApiRoutes from './routes/web'
 import { ApplyMiddleware } from './middlewares/all.middlewares';
-
+import { createProxyMiddleware } from 'http-proxy-middleware';
+import { Socket } from 'net';
 const { ExceptionHandler, UnhandledRoutes } = createHandlers();
 
 class AppServer {
@@ -26,6 +27,28 @@ class AppServer {
         this.RegisterRoutes();
         this.ExceptionHandler();
         this.GracefulShutdown()
+    }
+    private handleWebSocketProxy(server: http.Server) {
+        const webSocketProxy = createProxyMiddleware({
+            target: 'http://localhost:7555',
+           changeOrigin: true,
+            pathRewrite: { '^/ws': '/' },
+            ws: true,
+            logger: console.log,
+            on: {
+                proxyReqWs: (proxyReq, req, socket, options) => {
+                    Logging.dev(`Proxying WebSocket request for ${req.url}`);
+                }
+            }
+        });
+        server.on('upgrade', (req, socket, head) => {
+            if (req.url?.startsWith('/ws')) {
+                webSocketProxy.upgrade(req, socket as Socket, head);
+            }
+        });
+        return (req: Request, res: Response, next: NextFunction) => {
+            return webSocketProxy(req, res, next);
+        };
     }
     /**
      * Applies the necessary configurations to the AppServer.
@@ -88,6 +111,8 @@ class AppServer {
             console.log(blue(`Application Started Successfully on  http://localhost:${AppServer.PORT}`),)
         })
         InitSocketConnection(server)
+
+        AppServer.App.use(this.handleWebSocketProxy(server))
         server.on('close', () => {
             this.CloseServer(server)
         })

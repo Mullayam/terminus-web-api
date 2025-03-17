@@ -122,7 +122,10 @@ POST /api/sftp/upload
 GET /api/sftp/download 
 ```
 
-
+## LOCAL TERMINAL SOCKET EVENTS
+ - `@@SSH_EMIT_RESIZE` : When is Resize the xTerm
+ - `@@SEND_COMMAND` :  Use in `term.write()` function to send command to Backend to write cmd to PTY.
+ - `@@RECIEVE_COMMAND` : Use in `term.onData()` or  `term.data()` to recive the output from Backend.
 
 
 ## 🤝 Contributing
