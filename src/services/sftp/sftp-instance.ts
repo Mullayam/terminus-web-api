@@ -6,15 +6,11 @@ import fs from 'fs';
 import { join } from 'path';
 import AdmZip from 'adm-zip';
 
-
-
-
-
-
 import { FileOperationPayload } from '../../types/file-upload';
 import { Logging } from '@enjoys/express-utils/logger';
 export class SftpInstance {
     private currentPath = ''
+    private pwd = ''
 
     private readonly sftp: SFTPClient
     constructor(private socket: Socket) {
@@ -26,7 +22,7 @@ export class SftpInstance {
             this.socket.emit(SocketEventConstants.SFTP_READY, true);
             Logging.dev('Connected to SFTP server');
         }).catch((err) => {
-            Logging.dev("Error opening SFTP connection: " + err.message,"error");
+            Logging.dev("Error opening SFTP connection: " + err.message, "error");
             this.socket.emit(SocketEventConstants.SFTP_EMIT_ERROR, 'Error opening SFTP connection: ' + err.message);
             return;
         })
@@ -34,13 +30,18 @@ export class SftpInstance {
     getSftpInstance() {
         return this.sftp
     }
-    private sftpOperation() {
+    private sftpOperation(sftp: SFTPClient = this.sftp) {
         // Get files
-        const sftp = this.sftp
+
         const socket = this.socket
         sftp.on('debug', console.log);
         sftp.on('upload', (info) => socket.emit(SocketEventConstants.FILE_UPLOADED, info.destination));
-
+        const handler = async () => {
+            this.pwd = await sftp.cwd();
+            this.currentPath = this.pwd
+            return this.currentPath
+        }
+        socket.emit(SocketEventConstants.SFTP_CURRENT_PATH, handler);
         socket.on(SocketEventConstants.SFTP_ZIP_EXTRACT, async (payload: FileOperationPayload): Promise<any> => {
             try {
                 let dirPath: string | undefined = payload?.dirPath

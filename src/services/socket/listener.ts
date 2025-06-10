@@ -27,7 +27,7 @@ let TerminalSize = {
 const sftp = Sftp_Service.getSftpInstance()
 export const sftp_sessions = new Map<string, SftpInstance>()
 export class SocketListener {
-    private currentPath = '';
+    private currentPath = '/';
     private sessions: Map<string, Client> = new Map();
     private sessionCommands: Map<string, string> = new Map();
     constructor(
@@ -38,7 +38,8 @@ export class SocketListener {
     ) { }
     public onConnection(socket: Socket) {
         const sessionId = socket.handshake.query.sessionId as string;
-        console.log(`🔌 Client connected: ${sessionId} + ${socket.id}`);
+        sessionId ? console.log(`🔌 Client connected: ${sessionId} + ${socket.id}`) :
+            console.log(`🔌 Client connected: ${socket.id}`);
 
 
         // Listen for SFTP  connections
@@ -134,9 +135,6 @@ export class SocketListener {
 
             conn.on('ready', function () {
                 socket.emit(SocketEventConstants.SSH_READY, "Ready");
-                // Sftp_Service.connectSFTP(data as any)
-
-
 
                 conn.shell({ cols: TerminalSize.cols, rows: TerminalSize.rows, term: 'xterm-256color' }, function (err, stream) {
                     if (err) {
@@ -201,9 +199,10 @@ export class SocketListener {
             conn.on('handshake', (data: SSH_HANDSHAKE) => {
                 socket.emit(SocketEventConstants.SSH_EMIT_LOGS, data)
             })
-            const sftpIns = new SftpInstance(socket)
-            sftpIns.connectSFTP(data)
-            sftp_sessions.set(sessionId, sftpIns)
+            // const sftpIns = new SftpInstance(socket)
+            // sftpIns.connectSFTP(data)
+            // sftp_sessions.set(sessionId, sftpIns)
+
             _this.sessions.set(sessionId, conn);
 
         })
@@ -222,6 +221,7 @@ export class SocketListener {
         // Get files
         sftp.on('debug', console.log);
         sftp.on('upload', (info) => socket.emit(SocketEventConstants.FILE_UPLOADED, info.destination));
+        sftp.on('download', (info) => console.log(info));
 
         socket.on(SocketEventConstants.SFTP_ZIP_EXTRACT, async (payload: FileOperationPayload): Promise<any> => {
             try {
@@ -411,9 +411,25 @@ export class SocketListener {
     }
     private connectSFTP(socket: Socket) {
         socket.on(SocketEventConstants.SFTP_CONNECT, async (data: any) => {
-            const { host, username, ...sshOptions } = this.sshConfig(data);
-            const sftp = new SftpInstance(socket)
-            sftp.connectSFTP(this.sshConfig(data))
+            // const sftpIC = new SftpInstance(socket)
+            // sftpIC.connectSFTP()
+            !Sftp_Service.is_connected && await Sftp_Service.connectSFTP(this.sshConfig(data) as any)
+
+            if (Sftp_Service.is_connected) {
+
+                socket.emit(SocketEventConstants.SFTP_READY, true);
+                const handler = async () => {
+                    this.currentPath = await sftp.cwd();
+                    const files = await sftp.list(this.currentPath!)
+                    socket.emit(SocketEventConstants.SFTP_FILES_LIST, {
+                        files: JSON.stringify(files), currentDir: this.currentPath
+                    });
+                    return this.currentPath
+                }
+                const p = await handler()
+                socket.emit(SocketEventConstants.SFTP_CURRENT_PATH, p);
+            }
+
         })
     }
     private sshConfig(data: any) {
