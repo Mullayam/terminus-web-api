@@ -11,7 +11,9 @@ export enum SocketEventConstants {
   join_terminal = "@@join_terminal",
 
 
+  SSH_START_SESSION = "@@SSH_START_SESSION",
 
+  SSH_RESUME = "@@SSH_RESUME",
   SSH_CONNECT = "@@SSH_CONNECT",
   SSH_READY = "@@SSH_READY",
   SSH_EMIT_INPUT = "@@SSH_EMIT_INPUT",
@@ -29,6 +31,7 @@ export enum SocketEventConstants {
 
   // SFTP
   SFTP_CONNECT = "@@SFTP_CONNECT",
+  SFTP_EMIT_ERROR = "@@SFTP_EMIT_ERROR",
   SFTP_READY = "@@SFTP_READY",
   SFTP_GET_FILE = "@@SFTP_GET_FILE",
   SFTP_FILES_LIST = "@@SFTP_FILES_LIST",

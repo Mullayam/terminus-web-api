@@ -1,264 +1,146 @@
 import fs from 'fs';
-import path, { join } from 'path';
+import { join } from 'path';
 import AdmZip from 'adm-zip';
-import util from 'util'
-import SSH, { Client, ParsedKey } from 'ssh2';
-import validator from 'validator';
+
+import { Server } from "socket.io";
+
+import { Client, ParsedKey } from 'ssh2';
+
 import { Socket } from "socket.io";
-import dnsPromises from 'dns/promises'
-import CIDRMatcher from 'cidr-matcher';
-import { SSH_CONFIG_DATA, SSH_HANDSHAKE, SSH_RESIZE_WINDOW } from '../../types/ssh.interface';
+
+import { SSH_CONFIG_DATA, SSH_HANDSHAKE } from '../../types/ssh.interface';
 import { SocketEventConstants } from './events';
 import { Logging } from '@enjoys/express-utils/logger';
 import { FileOperationPayload } from '../../types/file-upload';
-import { Sftp_Service } from '../sftp';
-import utils from '@/utils';
-import terminalService from '@/handlers/providers/terminalService';
-import { publisher, subscriber } from '../cache';
 
-const sftp = Sftp_Service.getSftpInstance()
+import { RedisClientType } from 'redis';
+import { SftpInstance } from '../sftp/sftp-instance';
+import { Sftp_Service } from '../sftp/index';
 
-interface SshSession {
-    client: Client;
-    write: (input: string) => void;
-}
 
-interface SSHInstance {
-    sshClient: Client;
-    sessionId: string;
-    uid: string
-}
-const sessions: {
-    [key: string]: {
-        uid: string,
-        sessionId: string,
-    }
-} = {};
-const sshInstances: Record<string, SSHInstance> = {};
 let TerminalSize = {
     width: 0,
     height: 0,
     cols: 150,
     rows: 40
 }
+const sftp = Sftp_Service.getSftpInstance()
+export const sftp_sessions = new Map<string, SftpInstance>()
 export class SocketListener {
     private currentPath = '';
-    private sessions: Map<string, SshSession> = new Map();
+    private sessions: Map<string, Client> = new Map();
     private sessionCommands: Map<string, string> = new Map();
-
+    constructor(
+        private redisClient: RedisClientType,
+        private pubClient: RedisClientType,
+        private subClient: RedisClientType,
+        io: Server
+    ) { }
     public onConnection(socket: Socket) {
-        console.log("User connected: " + socket.id);
+        const sessionId = socket.handshake.query.sessionId as string;
+        console.log(`🔌 Client connected: ${sessionId} + ${socket.id}`);
+
+
         // Listen for SFTP  connections
         this.connectSFTP(socket);
         // Listen for SSH  connections
-        this.sshOperation2(socket);
+        this.sshOperation(socket);
         // Listen for file operations
         this.sftpOperation(socket);
         // Listen for Multiple session of Terminal Live Sharing operations
-        // this.hanndleMultipleSession(socket)
+
 
         socket.on('disconnecting', (reason) => { Logging.dev(`SOCKET DISCONNECTING: ${reason}`); });
         socket.on('disconnect', () => {
             socket.emit(SocketEventConstants.SSH_DISCONNECTED);
-            sftp.end();
-            console.log('User disconnected');
+            sftp.end()
+
         });
     }
 
-    private hanndleMultipleSession(socket: Socket) {
-        let sessionId = '';
-        // Generate a unique user ID for each connection
-        let uid = Math.random().toString(36).slice(2);
-        socket.on(SocketEventConstants.CreateTerminal, async (data: {
-            config: {
-                password: any;
-                privateKey?: undefined;
-                host: any;
-                username: any;
-            } | {
-                privateKey: any;
-                password?: undefined;
-                host: any;
-                username: any;
-            }
-            permissions: { read: boolean, write: boolean }
-        }) => {
-            try {
-                data = typeof data === 'string' ? (data = JSON.parse(data)) : data;
-                // Generate a unique Session ID for each connection
-                sessionId = utils.uuid_v4();
-                // Get the SSH configuration from Current Login Session User
-                const sshConfig = data.config
-                sessions[socket.id] = { uid, sessionId };
-                // Store the SSH configuration in a map
-                // Create a new SSH session
-                await terminalService.createSshSession(sessionId, sshConfig);
-                // Set permissions for the user                
-                terminalService.setPermissions(sessionId, uid, data.permissions);
-                // Emit the session ID to the client for sharing
-                socket.emit(SocketEventConstants.TerminalUrl, { uid, sessionId });
-                // Emit the permissions to the client
-                socket.emit(SocketEventConstants.SSH_PERMISSIONS, data.permissions);
-                // Subscribe to the session
-                terminalService.subscribeToSession(sessionId, (data: string) => {
-                    socket.emit(SocketEventConstants.terminal_output, data);
-                });
-            } catch (error) {
-                socket.emit(SocketEventConstants.Error, error);
-                Logging.dev('Failed to create SSH session:' + error, "error");
-            }
-        });
-        socket.on(SocketEventConstants.SSH_PERMISSIONS, ({ uid, permissions, sessionId }) => {
-            terminalService.setPermissions(sessionId, uid, permissions);
-            socket.emit("updatedPermissions", permissions);
 
-        });
-        socket.on(SocketEventConstants.terminal_input, async (input: string) => {
-            terminalService.handleInput(sessionId, input);
-        });
 
-        socket.on(SocketEventConstants.join_terminal, (joinSessionId: string) => {
-            sessionId = joinSessionId;
-            terminalService.subscribeToSession(sessionId, (data: string) => {
-                socket.emit(SocketEventConstants.terminal_output, data);
-            });
-        });
-        socket.on('disconnecting', () => {
-            socket.emit(SocketEventConstants.SESSIONN_END);
-        });
-        socket.on('disconnect', async () => {
-            const session = await this.getSessionStore(socket.id)
-            if (session) {
-                terminalService.unSubscribeToSession(session.sessionId, (data: string) => {
-                    socket.emit(SocketEventConstants.SUCCESS, "Session Disconnected");
-                })
-                delete sessions[socket.id]
-            }
-            console.log('Client disconnected');
-        });
-    }
-    private async getSessionStore(uid: string) {
-        return sessions[uid];
-    }
-    private sshOperation2(socket: Socket) {
-
+    private async sshOperation(socket: Socket) {
         const _this = this;
-        socket.on(SocketEventConstants.SSH_DISCONNECTED, (uid: string) => {
-            if (sshInstances[uid]) {
-                sshInstances[uid].sshClient.end();
-                delete sshInstances[uid]
-            }
-        })
-        socket.on(SocketEventConstants.SSH_CONNECT, function (data: SSH_CONFIG_DATA) {
-            let conn: Client = new Client({ captureRejections: true });
-            const userData = data.info
+        const sessionId = socket.handshake.query.sessionId as string;
+        // const resume = async () => {
+        //     const metaJson = await this.redisClient.get(`session:${sessionId}:meta`);
+        //     if (!metaJson) return false;
 
-            
-            const { host, username, ...sshOptions } = _this.sshConfig(data.config);
-            sshInstances[userData.uid] = { sshClient: conn, uid: userData.uid, sessionId: userData.sessionId };
+        //     const meta = JSON.parse(metaJson) as SessionMeta;
+        //     console.log(`♻️ Resuming session for ${sessionId} with`, meta.host);
+
+        //     const ssh = new Client();
+
+        //     ssh.on('ready', () => {
+        //         console.log(`✅ SSH Ready (Resumed): ${sessionId}`);
+        //         socket.emit(SocketEventConstants.SSH_READY, "Ready");
+
+        //         ssh.shell({ cols: TerminalSize.cols, rows: TerminalSize.rows, term: 'xterm-256color' }, (err, stream) => {
+        //             if (err) {
+        //                 socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'Error opening shell: ' + err.message);
+        //                 return;
+        //             }
+
+        //             // Stream SSH output to the client
+        //             stream.on('data', function (data: any) {
+        //                 socket.emit(SocketEventConstants.SSH_EMIT_DATA, data.toString('utf-8'));
+        //             });
+        //             socket.on(SocketEventConstants.SSH_EMIT_RESIZE, (data) => {
+        //                 TerminalSize.cols = data.cols
+        //                 TerminalSize.rows = data.rows
+        //                 stream.setWindow(data.rows, data.cols, 1280, 720);
+        //             });
+        //             // Listen for terminal input from client
+        //             socket.on(SocketEventConstants.SSH_EMIT_INPUT, function (input) {
+        //                 stream.write(input);
+        //             });
+        //             stream.on('close', function () {
+        //                 ssh.end();
+        //             });
+        //             stream.stderr.on('data', (data) => {
+        //                 Logging.dev(`STDERR: ${data}`, "error");
+        //             });
+        //             socket.on('disconnect', () => ssh.end());
+        //         });
+        //     });
+
+        //     ssh.on('error', (err) => {
+        //         socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'SSH connection error: ' + err.message);
+        //     });
+        //     ssh.connect({
+        //         host: meta.host,
+        //         port: meta.port,
+        //         username: meta.username,
+        //         ...(meta.privateKey ? { privateKey: meta.privateKey } : {}),
+        //         ...(meta.password ? { password: meta.password } : {})
+        //     });
+
+        //     this.sessions.set(sessionId, ssh);
+        //     return true;
+        // };
+
+        // const success = await resume();
+        // if (!success) {
+        //     console.log(`⚠️ No resumable session for: ${sessionId}`);
+        //     socket.emit('needs-auth');
+        // }
+
+        socket.on(SocketEventConstants.SSH_START_SESSION, async (input: string) => {
+
+            const data = this.sshConfig(JSON.parse(input));
+            console.log(`✨ Starting new session: ${sessionId}`);
+            let conn: Client = this.sessions.get(sessionId) || new Client({ captureRejections: true });
+
             conn.on('ready', function () {
-                socket.emit(SocketEventConstants.SSH_READY, userData);
-                Sftp_Service.connectSFTP({ host, username, ...sshOptions }).then(() => {
-                    socket.emit(SocketEventConstants.SFTP_READY, true);
-                })
+                socket.emit(SocketEventConstants.SSH_READY, "Ready");
+                // Sftp_Service.connectSFTP(data as any)
+
+
 
                 conn.shell({ cols: TerminalSize.cols, rows: TerminalSize.rows, term: 'xterm-256color' }, function (err, stream) {
                     if (err) {
-                        socket.emit(SocketEventConstants.SSH_EMIT_ERROR, { uid: userData.uid, input: 'Error opening shell: ' + err.message });
-                        return;
-                    }
-
-                    // Stream SSH output to the client
-                    stream.on('data', function (data: any) {
-                        socket.emit(SocketEventConstants.SSH_EMIT_DATA, { uid: userData.uid, input: data.toString('utf-8') });
-                    });
-                    socket.on(SocketEventConstants.SSH_EMIT_RESIZE, (data: SSH_RESIZE_WINDOW) => {
-                        if (sshInstances.hasOwnProperty(data.uid)) {
-                            TerminalSize.cols = data.size.cols
-                            TerminalSize.rows = data.size.rows
-                            stream.setWindow(data.size.rows, data.size.cols, 1280, 720);
-                        }
-
-                    });
-                    // Listen for terminal input from client
-                    socket.on(SocketEventConstants.SSH_EMIT_INPUT, function ({ uid, input }) {
-                        if (sshInstances.hasOwnProperty(uid)) {
-                            stream.write(input);
-                        }
-                    });
-                    stream.on('close', function () {
-                        conn.end();
-                    });
-                    stream.stderr.on('data', (data) => {
-                        Logging.dev(`STDERR: ${data}`, "error");
-                    });
-                    socket.on('disconnect', () => {
-                        stream.end();
-                        conn.end();
-                        delete sshInstances[userData.uid];
-                    });
-                });
-            })
-                .on('error', function (err) {
-                    socket.emit(SocketEventConstants.SSH_EMIT_ERROR, { uid: userData.uid, input: 'Error opening shell: ' + err.message });
-                })
-                .connect({
-                    host: host,
-                    port: 22,
-                    username: username,
-                    ...sshOptions,
-                    debug: (info) => socket.emit(SocketEventConstants.SSH_EMIT_LOGS, { uid: userData.uid, info })
-
-                });
-            conn.on('banner', (data) => {
-                socket.emit(SocketEventConstants.SSH_BANNER, data.replace(/\r?\n/g, '\r\n').toString());
-            })
-                .on("tcp connection", (details, accept, reject) => {
-                    console.log("TCP connection request received", details);
-                    const channel = accept(); // Accept the connection and return a Channel object
-                    if (channel) {
-                        channel.on("data", (data: any) => {
-                            socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, data.toString())
-                        });
-                    }
-                    socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, details)
-                })
-                .on("change password", (message, done) => {
-                    console.log("Password change required: ", message);
-                    done("new-password");
-                })
-                .on('keyboard-interactive', (_name, _instructions, _instructionsLang, _prompts, finish) => {
-                    // console.log(_name, _instructions, _instructionsLang, _prompts,)
-                    // finish([socket.request.session.userpassword]);
-                })
-                .on("hostkeys", (keys: ParsedKey[]) => {
-                    socket.emit(SocketEventConstants.SSH_HOST_KEYS, keys);
-                })
-                .on('handshake', (data: SSH_HANDSHAKE) => {
-                    socket.emit(SocketEventConstants.SSH_EMIT_LOGS, data)
-                })
-
-        });
-    }
-    private sshOperation(socket: Socket) {
-        let conn: Client = new Client({
-            captureRejections: true
-        });
-        const _this = this;
-        socket.on(SocketEventConstants.SSH_CONNECT, function (data) {
-            const userData = { uid: Math.random().toString(36).slice(2), sessionId: utils.uuid_v4() }
-
-            const { host, username, ...sshOptions } = _this.sshConfig(data);
-
-            conn.on('ready', function () {
-                socket.emit(SocketEventConstants.SSH_READY, userData);
-                Sftp_Service.connectSFTP({ host, username, ...sshOptions }).then(() => {
-                    socket.emit(SocketEventConstants.SFTP_READY, true);
-                })
-
-                conn.shell({ cols: TerminalSize.cols, rows: TerminalSize.rows, term: 'xterm-256color' }, function (err, stream) {
-                    if (err) {
-
+                        console.log("Error opening shell: " + err.message);
                         socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'Error opening shell: ' + err.message);
                         return;
                     }
@@ -282,52 +164,59 @@ export class SocketListener {
                     stream.stderr.on('data', (data) => {
                         Logging.dev(`STDERR: ${data}`, "error");
                     });
-                });
-            })
-                .on('error', function (err) {
-                    console.log(err)
-                    socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'SSH connection error: ' + err.message);
-                })
-                .connect({
-                    host: host,
-                    port: 22,
-                    username: username,
-                    ...sshOptions,
-                    debug: (info) => socket.emit(SocketEventConstants.SSH_EMIT_LOGS, { uid: userData.uid, info })
+                    socket.on('disconnect', () => conn.end());
 
                 });
+            })
+            conn.on('error', function (err) {
+                console.log(err)
+                socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'SSH connection error: ' + err.message);
+            })
+            conn.connect(data)
             conn.on('banner', (data) => {
                 // need to convert to cr/lf for proper formatting
                 socket.emit(SocketEventConstants.SSH_BANNER, data.replace(/\r?\n/g, '\r\n').toString());
             })
-                .on("tcp connection", (details, accept, reject) => {
-                    console.log("TCP connection request received", details);
-                    const channel = accept(); // Accept the connection and return a Channel object
-                    if (channel) {
-                        channel.on("data", (data: any) => {
-                            socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, data.toString())
-                        });
-                    }
-                    socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, details)
-                })
-                .on("change password", (message, done) => {
-                    console.log("Password change required: ", message);
-                    done("new-password");
-                })
-                .on('keyboard-interactive', (_name, _instructions, _instructionsLang, _prompts, finish) => {
-                    // console.log(_name, _instructions, _instructionsLang, _prompts,)
-                    // finish([socket.request.session.userpassword]);
-                })
-                .on("hostkeys", (keys: ParsedKey[]) => {
-                    socket.emit(SocketEventConstants.SSH_HOST_KEYS, keys);
-                })
-                .on('handshake', (data: SSH_HANDSHAKE) => {
-                    socket.emit(SocketEventConstants.SSH_EMIT_LOGS, data)
-                })
-            socket.on('disconnect', () => {
-                conn.end();
-            });
+            conn.on("tcp connection", (details, accept, reject) => {
+                console.log("TCP connection request received", details);
+                const channel = accept(); // Accept the connection and return a Channel object
+                if (channel) {
+                    channel.on("data", (data: any) => {
+                        socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, data.toString())
+                    });
+                }
+                socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, details)
+            })
+            conn.on("change password", (message, done) => {
+                console.log("Password change required: ", message);
+                done("new-password");
+            })
+            conn.on('keyboard-interactive', (_name, _instructions, _instructionsLang, _prompts, finish) => {
+                // console.log(_name, _instructions, _instructionsLang, _prompts,)
+                // finish([socket.request.session.userpassword]);
+            })
+            conn.on("hostkeys", (keys: ParsedKey[]) => {
+                socket.emit(SocketEventConstants.SSH_HOST_KEYS, keys);
+            })
+            conn.on('handshake', (data: SSH_HANDSHAKE) => {
+                socket.emit(SocketEventConstants.SSH_EMIT_LOGS, data)
+            })
+            const sftpIns = new SftpInstance(socket)
+            sftpIns.connectSFTP(data)
+            sftp_sessions.set(sessionId, sftpIns)
+            _this.sessions.set(sessionId, conn);
+
+        })
+
+        socket.on('disconnect', () => {
+            const ssh = this.sessions.get(sessionId);
+            if (ssh) ssh.end();
+            this.sessions.delete(sessionId);
+            sftp_sessions.delete(sessionId)
+            console.log(`❌ Disconnected: ${sessionId}`);
         });
+
+
     }
     sftpOperation(socket: Socket) {
         // Get files
@@ -521,9 +410,10 @@ export class SocketListener {
         });
     }
     private connectSFTP(socket: Socket) {
-        socket.on(SocketEventConstants.SFTP_CONNECT, (data: any) => {
+        socket.on(SocketEventConstants.SFTP_CONNECT, async (data: any) => {
             const { host, username, ...sshOptions } = this.sshConfig(data);
-            Sftp_Service.connectSFTP({ host, username, ...sshOptions })
+            const sftp = new SftpInstance(socket)
+            sftp.connectSFTP(this.sshConfig(data))
         })
     }
     private sshConfig(data: any) {
@@ -533,6 +423,7 @@ export class SocketListener {
 
             return {
                 host: data.host,
+                port: +data.port || 22,
                 username: data.username,
                 ...sshOptions
             }
@@ -541,6 +432,7 @@ export class SocketListener {
 
         return {
             host: data.host,
+            port: +data.port || 22,
             username: data.username,
             ...sshOptions
         }
