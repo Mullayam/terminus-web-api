@@ -4,13 +4,14 @@ import { UploadedFile as ExpressUploadedFile } from 'express-fileupload';
 import { Sftp_Service } from '@services/sftp';
 import { getSocketIo } from '@/services/socket';
 import { SocketEventConstants } from '@/services/socket/events';
-import { createReadStream, createWriteStream, existsSync, mkdirSync, rm, rmSync, unlinkSync } from 'fs';
+import { createReadStream,  existsSync, mkdirSync, rm,} from 'fs'
 import archiver from 'archiver';
 const sftp = Sftp_Service.getSftpInstance()
 import progress from 'progress-stream'
 import utils from '@/utils';
 
 const uploadPath = join(process.cwd(), 'storage');
+export const ABORT_CONTROLLER_MAP = new Map<string, AbortController>()
 class SFTPController {
     constructor() {
         if (!existsSync(uploadPath)) {
@@ -124,79 +125,50 @@ class SFTPController {
             }
             const remotePath = body.remotePath
             const localPath = join(process.cwd(), 'storage', basename(remotePath))
+            const abortController = new AbortController();
+            ABORT_CONTROLLER_MAP.set(body.name, abortController);
+            const signal = abortController.signal
 
+            const stats = await sftp.stat(remotePath)
+            
             if (body.type === "file") {
-                const totalSize = (await sftp.stat(remotePath)).size;
+                const totalSize = stats.size;
                 let downloaded = 0;
+                signal.addEventListener('abort', () => {
+                    getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, {
+                        name: body.name,
+                        percent: 100,
+                        downloaded,
+                        totalSize,
+                        status: 'error'
+                    });
+                    ABORT_CONTROLLER_MAP.delete(body.name);
+                    try {
+                        res.status(499).end('Request aborted by client.');
+                    } catch (_) { }
+                });
 
-                // await sftp.fastGet(remotePath, localPath);
                 const stream = sftp.createReadStream(remotePath);
-                // const writeStream = createWriteStream(localPath);
+
 
                 stream.on('data', (chunk: Buffer) => {
+                    if (signal.aborted) {
+                        stream.destroy();
+                        return
+                    }
                     downloaded += chunk.length;
                     const percent = Math.floor((downloaded / totalSize) * 100);
-                    getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, { name: body.name, percent, totalSize, downloaded });
+                    getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, { name: body.name, percent, totalSize, downloaded, status: 'downloading' });
                 });
                 stream.on("end", () => {
-                    getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, { name: body.name, percent: 100, totalSize, downloaded });
+                    getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, { name: body.name, percent: 100, totalSize, downloaded, status: 'completed' });
                 })
                 stream.pipe(res);
-                // await new Promise((resolve, reject) => {
-                //     stream.on('error', reject);
-                //     writeStream.on('error', reject);
-                //     writeStream.on('close', () => {
-                //         getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, { name: body.name, percent: 100, totalSize });
-                //         resolve("File Downloaded Successfully");
-                //     });
-                //     stream.pipe(writeStream);
-                // });
-                // res.download(localPath, body.name, (err) => {
-                //     if (err) {
-                //         console.error("Error sending file:", err);
-                //         getSocketIo().emit(SocketEventConstants.ERROR, "Error sending downloaded file.");
-                //         res.status(500).end();
-                //     } else {
-                //         getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, {
-                //             name: body.name,
-                //             percent: 100,
-                //             totalSize
-                //         });
-                //         getSocketIo().emit(SocketEventConstants.SUCCESS, `${body.name} Downloaded Successfully`);
-                //         unlinkSync(localPath);
-                //         res.status(200).end();
-                //     }
-                // });
 
                 return
             }
             else {
-
-                //     await sftp.downloadDir(remotePath, localPath, {
-                //         useFastget: true,
-                //         filter: (filePath: string, isDirectory: boolean) => {
-                //             if (filePath.includes('.git') || filePath.includes('node_modules') || filePath.includes('build') || filePath.includes('dist')) {
-                //                 return false
-                //             }
-                //             if (basename(filePath).includes('.git') || filePath.includes('node_modules') || filePath.includes('build') || filePath.includes('dist')) {
-                //                 return false
-                //             }
-                //             return true
-                //         }
-                //     });
-                //     res.setHeader('Content-Type', 'application/zip');
-                //     res.setHeader('Content-Disposition', `attachment; filename=${body.name}.zip`);
-                //     const archive = archiver('zip', {
-                //         zlib: { level: 9 },
-                //     });
-                //     archive.directory(localPath, false);
-                //     archive.pipe(res);
-                //     archive.finalize();
-                //     archive.on('end', () => {
-                //         rmSync(localPath, { recursive: true, force: true });
-                //         res.end();
-                //     });
-
+                let downloadedBytes = 0;
                 const fileList = await sftp.list(remotePath, undefined);
                 const filteredFiles = fileList.filter(
                     (file) =>
@@ -207,12 +179,25 @@ class SFTPController {
                 );
 
                 const totalSize = filteredFiles.reduce((sum, file) => sum + file.size, 0);
+
+                signal.addEventListener('abort', () => {
+                    getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, {
+                        name: body.name,
+                        percent: 100,
+                        downloaded: downloadedBytes,
+                        totalSize,
+                        status: 'error'
+                    });
+                    ABORT_CONTROLLER_MAP.delete(body.name);
+                    try {
+                        res.status(499).end('Request aborted by client.');
+                    } catch (_) { }
+                });
                 res.setHeader('Content-Type', 'application/zip');
                 res.setHeader('Content-Disposition', `attachment; filename="${body.name}.zip"`);
 
                 const archive = archiver('zip', { zlib: { level: 9 } });
                 archive.pipe(res);
-                let downloadedBytes = 0;
                 for await (const file of filteredFiles) {
 
                     const remoteFilePath = `${remotePath}/${file.name}`;
@@ -222,6 +207,11 @@ class SFTPController {
 
                     await new Promise<void>((resolve, reject) => {
                         fileStream.on('data', (chunk: Buffer) => {
+                            if (signal.aborted) {
+                                fileStream.destroy();
+                                reject(new Error("Aborted"));
+                                return;
+                            }
                             chunks.push(chunk);
                             downloadedBytes += chunk.length;
 
@@ -231,6 +221,7 @@ class SFTPController {
                                 downloaded: downloadedBytes,
                                 totalSize,
                                 percent,
+                                status: 'downloading'
                             });
                         });
 
@@ -242,16 +233,29 @@ class SFTPController {
                     archive.append(fileBuffer, { name: file.name });
                 }
                 archive.on('progress', (progress) => {
-                    getSocketIo().emit(SocketEventConstants.COMPRESSING, {
-                        entries: progress.entries,
-                        fs: progress.fs,
-                    });
+                    if (!signal.aborted) {
+                        getSocketIo().emit(SocketEventConstants.COMPRESSING, {
+                            entries: progress.entries,
+                            fs: progress.fs,
+                        });
+                    }
                 });
 
                 archive.finalize();
 
                 archive.on('end', () => {
-                    res.end();
+                    
+                    if (!signal.aborted) {
+                        getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, {
+                            name: body.name,
+                            downloaded: downloadedBytes,
+                            totalSize,
+                            percent: 100,
+                            status: 'completed'
+                        });
+                        res.end();
+                    }
+
                 });
             }
 

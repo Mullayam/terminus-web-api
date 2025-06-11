@@ -16,6 +16,7 @@ import { FileOperationPayload } from '../../types/file-upload';
 import { RedisClientType } from 'redis';
 import { SftpInstance } from '../sftp/sftp-instance';
 import { Sftp_Service } from '../sftp/index';
+import { ABORT_CONTROLLER_MAP } from '@/handlers/controllers/sftp.controller';
 
 
 let TerminalSize = {
@@ -38,8 +39,8 @@ export class SocketListener {
     ) { }
     public onConnection(socket: Socket) {
         const sessionId = socket.handshake.query.sessionId as string;
-        sessionId ? console.log(`🔌 Client connected: ${sessionId} + ${socket.id}`) :
-            console.log(`🔌 Client connected: ${socket.id}`);
+        sessionId ? Logging.dev(`🔌 Client connected: ${sessionId} + ${socket.id}`) :
+            Logging.dev(`🔌 Client connected: ${socket.id}`);
 
 
         // Listen for SFTP  connections
@@ -130,15 +131,17 @@ export class SocketListener {
         socket.on(SocketEventConstants.SSH_START_SESSION, async (input: string) => {
 
             const data = this.sshConfig(JSON.parse(input));
-            console.log(`✨ Starting new session: ${sessionId}`);
+            Logging.dev(`✨ Starting new session: ${sessionId}`);
             let conn: Client = this.sessions.get(sessionId) || new Client({ captureRejections: true });
 
             conn.on('ready', function () {
                 socket.emit(SocketEventConstants.SSH_READY, "Ready");
+                Logging.dev(`✅ SSH Ready: ${sessionId}`);
+
 
                 conn.shell({ cols: TerminalSize.cols, rows: TerminalSize.rows, term: 'xterm-256color' }, function (err, stream) {
                     if (err) {
-                        console.log("Error opening shell: " + err.message);
+                        Logging.dev("Error opening shell: " + err.message,"error");
                         socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'Error opening shell: ' + err.message);
                         return;
                     }
@@ -171,28 +174,28 @@ export class SocketListener {
                 socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'SSH connection error: ' + err.message);
             })
             conn.connect(data)
-            conn.on('banner', (data) => {
-                // need to convert to cr/lf for proper formatting
-                socket.emit(SocketEventConstants.SSH_BANNER, data.replace(/\r?\n/g, '\r\n').toString());
-            })
-            conn.on("tcp connection", (details, accept, reject) => {
-                console.log("TCP connection request received", details);
-                const channel = accept(); // Accept the connection and return a Channel object
-                if (channel) {
-                    channel.on("data", (data: any) => {
-                        socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, data.toString())
-                    });
-                }
-                socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, details)
-            })
-            conn.on("change password", (message, done) => {
-                console.log("Password change required: ", message);
-                done("new-password");
-            })
-            conn.on('keyboard-interactive', (_name, _instructions, _instructionsLang, _prompts, finish) => {
-                // console.log(_name, _instructions, _instructionsLang, _prompts,)
-                // finish([socket.request.session.userpassword]);
-            })
+            // conn.on('banner', (data) => {
+            //     // need to convert to cr/lf for proper formatting
+            //     socket.emit(SocketEventConstants.SSH_BANNER, data.replace(/\r?\n/g, '\r\n').toString());
+            // })
+            // conn.on("tcp connection", (details, accept, reject) => {
+            //     console.log("TCP connection request received", details);
+            //     const channel = accept(); // Accept the connection and return a Channel object
+            //     if (channel) {
+            //         channel.on("data", (data: any) => {
+            //             socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, data.toString())
+            //         });
+            //     }
+            //     socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, details)
+            // })
+            // conn.on("change password", (message, done) => {
+            //     console.log("Password change required: ", message);
+            //     done("new-password");
+            // })
+            // conn.on('keyboard-interactive', (_name, _instructions, _instructionsLang, _prompts, finish) => {
+            //     // console.log(_name, _instructions, _instructionsLang, _prompts,)
+            //     // finish([socket.request.session.userpassword]);
+            // })
             conn.on("hostkeys", (keys: ParsedKey[]) => {
                 socket.emit(SocketEventConstants.SSH_HOST_KEYS, keys);
             })
@@ -222,6 +225,16 @@ export class SocketListener {
         sftp.on('debug', console.log);
         sftp.on('upload', (info) => socket.emit(SocketEventConstants.FILE_UPLOADED, info.destination));
         sftp.on('download', (info) => console.log(info));
+        const progressCancelHandler = async (name: string) => {
+            ABORT_CONTROLLER_MAP.set(name, new AbortController())
+            const controller = ABORT_CONTROLLER_MAP.get(name)
+            if (controller) {
+                controller.abort()
+                ABORT_CONTROLLER_MAP.delete(name)
+            }
+        }
+        socket.on(SocketEventConstants.CANCEL_UPLOADING, progressCancelHandler)
+        socket.on(SocketEventConstants.CANCEL_DOWNLOADING, progressCancelHandler)
 
         socket.on(SocketEventConstants.SFTP_ZIP_EXTRACT, async (payload: FileOperationPayload): Promise<any> => {
             try {
