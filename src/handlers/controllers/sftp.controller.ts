@@ -4,7 +4,7 @@ import { UploadedFile as ExpressUploadedFile } from 'express-fileupload';
 import { Sftp_Service } from '@services/sftp';
 import { getSocketIo } from '@/services/socket';
 import { SocketEventConstants } from '@/services/socket/events';
-import { createReadStream,  existsSync, mkdirSync, rm,} from 'fs'
+import { createReadStream, existsSync, mkdirSync, rm, } from 'fs'
 import archiver from 'archiver';
 const sftp = Sftp_Service.getSftpInstance()
 import progress from 'progress-stream'
@@ -41,11 +41,7 @@ class SFTPController {
                         throw err
                     }
                 });
-
-
-
             }
-
 
             await sftp.uploadDir(dirPath, path, {
                 filter: (filePath: string) => {
@@ -130,17 +126,31 @@ class SFTPController {
             const signal = abortController.signal
 
             const stats = await sftp.stat(remotePath)
-            
+
             if (body.type === "file") {
+
                 const totalSize = stats.size;
-                let downloaded = 0;
+
+                const stream = sftp.createReadStream(remotePath);
+
+                const str = progress({
+                    length: totalSize,
+                    time: 1000, // emit progress every 1 second
+                });
+
                 signal.addEventListener('abort', () => {
+                    str.destroy();
+                    stream.destroy();
                     getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, {
                         name: body.name,
-                        percent: 100,
-                        downloaded,
+                        downloaded: str?.progress().transferred || 0,
                         totalSize,
-                        status: 'error'
+                        percent: str?.progress().percentage.toFixed(2) || 100,
+                        speed: 0,
+                        eta: 0,
+                        status: 'error',
+                        remaining: utils.convertBytes(str?.progress()?.remaining || 0)
+
                     });
                     ABORT_CONTROLLER_MAP.delete(body.name);
                     try {
@@ -148,25 +158,40 @@ class SFTPController {
                     } catch (_) { }
                 });
 
-                const stream = sftp.createReadStream(remotePath);
-
-
-                stream.on('data', (chunk: Buffer) => {
-                    if (signal.aborted) {
-                        stream.destroy();
-                        return
-                    }
-                    downloaded += chunk.length;
-                    const percent = Math.floor((downloaded / totalSize) * 100);
-                    getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, { name: body.name, percent, totalSize, downloaded, status: 'downloading' });
+                str.on('progress', (progressData) => {
+                    if (signal.aborted) return;
+                    getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, {
+                        name: body.name,
+                        downloaded: progressData.transferred,
+                        totalSize,
+                        percent: Math.round(progressData.percentage),
+                        speed: `${Math.round(progressData.speed / 1024)} KB/s`,
+                        eta: progressData.eta,
+                        status: 'downloading',
+                        remaining: utils.convertBytes(progressData.remaining || 0),
+                    });
                 });
-                stream.on("end", () => {
-                    getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, { name: body.name, percent: 100, totalSize, downloaded, status: 'completed' });
-                })
-                stream.pipe(res);
 
-                return
+                str.on('end', () => {
+                    if (!signal.aborted) {
+                        getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, {
+                            name: body.name,
+                            downloaded: utils.convertBytes(str?.progress()?.transferred || totalSize),
+                            totalSize,
+                            percent: str?.progress().percentage.toFixed(2) || 100,
+                            speed: 0,
+                            eta: 0,
+                            status: 'completed',
+                            remaining: utils.convertBytes(str?.progress()?.remaining || 0)
+                        });
+                    }
+                });
+
+
+                stream.pipe(str).pipe(res);
+                return;
             }
+
             else {
                 let downloadedBytes = 0;
                 const fileList = await sftp.list(remotePath, undefined);
@@ -244,7 +269,7 @@ class SFTPController {
                 archive.finalize();
 
                 archive.on('end', () => {
-                    
+
                     if (!signal.aborted) {
                         getSocketIo().emit(SocketEventConstants.DOWNLOAD_PROGRESS, {
                             name: body.name,
