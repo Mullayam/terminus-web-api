@@ -13,7 +13,7 @@ import express, { Application, NextFunction, Response, Request } from 'express'
 import fileUpload from 'express-fileupload';
 import ApiRoutes from './routes/web'
 import { ApplyMiddleware } from './middlewares/all.middlewares';
-
+Logging.setLocalAppName("TERMINUS");
 const { ExceptionHandler, UnhandledRoutes } = createHandlers();
 
 class AppServer {

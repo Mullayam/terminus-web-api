@@ -3,12 +3,12 @@ export enum SocketEventConstants {
   Error = "@@Error",
 
   SESSIONN_END = "@@SESSIONN_END",
-
   CreateTerminal = "@@Create_Terminal",
   TerminalUrl = "@@Terminal_Url",
   terminal_output = "@@terminal_output",
   terminal_input = "@@terminal_input",
   join_terminal = "@@join_terminal",
+  session_not_found = "@@session_not_found",
 
 
   SSH_START_SESSION = "@@SSH_START_SESSION",

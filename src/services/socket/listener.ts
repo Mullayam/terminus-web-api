@@ -19,6 +19,7 @@ import { Sftp_Service } from '../sftp/index';
 import { ABORT_CONTROLLER_MAP } from '@/handlers/controllers/sftp.controller';
 
 
+
 let TerminalSize = {
     width: 0,
     height: 0,
@@ -30,12 +31,12 @@ export const sftp_sessions = new Map<string, SftpInstance>()
 export class SocketListener {
     private currentPath = '/';
     private sessions: Map<string, Client> = new Map();
-    private sessionCommands: Map<string, string> = new Map();
+    private sharedTerminalSessions: Map<string, string[]> = new Map();
     constructor(
         private redisClient: RedisClientType,
         private pubClient: RedisClientType,
         private subClient: RedisClientType,
-        io: Server
+        private readonly io: Server
     ) { }
     public onConnection(socket: Socket) {
         const sessionId = socket.handshake.query.sessionId as string;
@@ -50,77 +51,102 @@ export class SocketListener {
         // Listen for file operations
         this.sftpOperation(socket);
         // Listen for Multiple session of Terminal Live Sharing operations
-
+        this.terminalSharingSession(socket);
 
         socket.on('disconnecting', (reason) => { Logging.dev(`SOCKET DISCONNECTING: ${reason}`); });
         socket.on('disconnect', () => {
             socket.emit(SocketEventConstants.SSH_DISCONNECTED);
+
             sftp.end()
 
         });
     }
 
+    private terminalSharingSession(socket: Socket) {
+        socket.on(SocketEventConstants.CreateTerminal, (session_id: string) => {
+            if (!this.sessions.has(session_id)) {
+                return this.io.to(socket.id).emit(SocketEventConstants.session_not_found, "Session not found");
+            }
+
+            const existingSocketIds = this.sharedTerminalSessions.get(session_id) || [];
+
+            if (!existingSocketIds.includes(socket.id)) {
+                existingSocketIds.push(socket.id);
+                this.sharedTerminalSessions.set(session_id, existingSocketIds);
+                this.io.to(socket.id).emit(SocketEventConstants.join_terminal, session_id);
+            }
+        });
+        this.subClient.pSubscribe(`terminal:*`, this.subscribeToSession)
+    }
+
+    subscribeToSession = (message: string, channel: string) => {
+        const _this = this
+        const session_id = channel.split(':')[1];
+        const socketIds = _this.sharedTerminalSessions.get(session_id) || [];
 
 
+        socketIds.forEach((sockId) => {
+
+            const targetSocket = _this.io.sockets.sockets.get(sockId);
+
+            if (targetSocket) {
+                targetSocket.emit(SocketEventConstants.terminal_output, message);
+            }
+        });
+    }
     private async sshOperation(socket: Socket) {
         const _this = this;
         const sessionId = socket.handshake.query.sessionId as string;
-        // const resume = async () => {
-        //     const metaJson = await this.redisClient.get(`session:${sessionId}:meta`);
-        //     if (!metaJson) return false;
+        const resume = async () => {
 
-        //     const meta = JSON.parse(metaJson) as SessionMeta;
-        //     console.log(`♻️ Resuming session for ${sessionId} with`, meta.host);
+            const metaJson = await this.redisClient.get(`session:${sessionId}`);
+            if (!metaJson) return false;
 
-        //     const ssh = new Client();
+            const meta = JSON.parse(metaJson) as ReturnType<typeof this.sshConfig>;
+            console.log(`♻️ Resuming session for ${sessionId} with`, meta.host);
 
-        //     ssh.on('ready', () => {
-        //         console.log(`✅ SSH Ready (Resumed): ${sessionId}`);
-        //         socket.emit(SocketEventConstants.SSH_READY, "Ready");
+            const ssh = new Client();
 
-        //         ssh.shell({ cols: TerminalSize.cols, rows: TerminalSize.rows, term: 'xterm-256color' }, (err, stream) => {
-        //             if (err) {
-        //                 socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'Error opening shell: ' + err.message);
-        //                 return;
-        //             }
+            ssh.on('ready', () => {
+                console.log(`✅ SSH Ready (Resumed): ${sessionId}`);
+                socket.emit(SocketEventConstants.SSH_READY, "Ready");
 
-        //             // Stream SSH output to the client
-        //             stream.on('data', function (data: any) {
-        //                 socket.emit(SocketEventConstants.SSH_EMIT_DATA, data.toString('utf-8'));
-        //             });
-        //             socket.on(SocketEventConstants.SSH_EMIT_RESIZE, (data) => {
-        //                 TerminalSize.cols = data.cols
-        //                 TerminalSize.rows = data.rows
-        //                 stream.setWindow(data.rows, data.cols, 1280, 720);
-        //             });
-        //             // Listen for terminal input from client
-        //             socket.on(SocketEventConstants.SSH_EMIT_INPUT, function (input) {
-        //                 stream.write(input);
-        //             });
-        //             stream.on('close', function () {
-        //                 ssh.end();
-        //             });
-        //             stream.stderr.on('data', (data) => {
-        //                 Logging.dev(`STDERR: ${data}`, "error");
-        //             });
-        //             socket.on('disconnect', () => ssh.end());
-        //         });
-        //     });
+                // ssh.shell({ cols: TerminalSize.cols, rows: TerminalSize.rows, term: 'xterm-256color' }, (err, stream) => {
+                //     if (err) {
+                //         socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'Error opening shell: ' + err.message);
+                //         return;
+                //     }
 
-        //     ssh.on('error', (err) => {
-        //         socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'SSH connection error: ' + err.message);
-        //     });
-        //     ssh.connect({
-        //         host: meta.host,
-        //         port: meta.port,
-        //         username: meta.username,
-        //         ...(meta.privateKey ? { privateKey: meta.privateKey } : {}),
-        //         ...(meta.password ? { password: meta.password } : {})
-        //     });
+                //     // Stream SSH output to the client
+                //     stream.on('data', function (data: any) {
+                //         socket.emit(SocketEventConstants.SSH_EMIT_DATA, data.toString('utf-8'));
+                //     });
+                //     socket.on(SocketEventConstants.SSH_EMIT_RESIZE, (data) => {
+                //         TerminalSize.cols = data.cols
+                //         TerminalSize.rows = data.rows
+                //         stream.setWindow(data.rows, data.cols, 1280, 720);
+                //     });
+                //     // Listen for terminal input from client
+                //     socket.on(SocketEventConstants.SSH_EMIT_INPUT, function (input) {
+                //         stream.write(input);
+                //     });
+                //     stream.on('close', function () {
+                //         ssh.end();
+                //     });
+                //     stream.stderr.on('data', (data) => {
+                //         Logging.dev(`STDERR: ${data}`, "error");
+                //     });
+                //     socket.on('disconnect', () => ssh.end());
+                // });
+            });
 
-        //     this.sessions.set(sessionId, ssh);
-        //     return true;
-        // };
+            ssh.on('error', (err) => {
+                socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'SSH connection error: ' + err.message);
+            });
+            ssh.connect(meta);
+            this.sessions.set(sessionId, ssh);
+            return true;
+        };
 
         // const success = await resume();
         // if (!success) {
@@ -141,14 +167,18 @@ export class SocketListener {
 
                 conn.shell({ cols: TerminalSize.cols, rows: TerminalSize.rows, term: 'xterm-256color' }, function (err, stream) {
                     if (err) {
-                        Logging.dev("Error opening shell: " + err.message,"error");
+                        Logging.dev("Error opening shell: " + err.message, "error");
                         socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'Error opening shell: ' + err.message);
                         return;
                     }
 
                     // Stream SSH output to the client
                     stream.on('data', function (data: any) {
-                        socket.emit(SocketEventConstants.SSH_EMIT_DATA, data.toString('utf-8'));
+                        const text = data.toString('utf-8')
+                        socket.emit(SocketEventConstants.SSH_EMIT_DATA, text);
+                        _this.pubClient.publish(`terminal:${sessionId}`, text);
+                        // _this.redisClient.rPush(`logs:${sessionId}`, text);
+
                     });
                     socket.on(SocketEventConstants.SSH_EMIT_RESIZE, (data) => {
                         TerminalSize.cols = data.cols
@@ -174,28 +204,11 @@ export class SocketListener {
                 socket.emit(SocketEventConstants.SSH_EMIT_ERROR, 'SSH connection error: ' + err.message);
             })
             conn.connect(data)
-            // conn.on('banner', (data) => {
-            //     // need to convert to cr/lf for proper formatting
-            //     socket.emit(SocketEventConstants.SSH_BANNER, data.replace(/\r?\n/g, '\r\n').toString());
-            // })
-            // conn.on("tcp connection", (details, accept, reject) => {
-            //     console.log("TCP connection request received", details);
-            //     const channel = accept(); // Accept the connection and return a Channel object
-            //     if (channel) {
-            //         channel.on("data", (data: any) => {
-            //             socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, data.toString())
-            //         });
-            //     }
-            //     socket.emit(SocketEventConstants.SSH_TCP_CONNECTION, details)
-            // })
-            // conn.on("change password", (message, done) => {
-            //     console.log("Password change required: ", message);
-            //     done("new-password");
-            // })
-            // conn.on('keyboard-interactive', (_name, _instructions, _instructionsLang, _prompts, finish) => {
-            //     // console.log(_name, _instructions, _instructionsLang, _prompts,)
-            //     // finish([socket.request.session.userpassword]);
-            // })
+            conn.on('banner', (data) => {
+
+                socket.emit(SocketEventConstants.SSH_BANNER, data.replace(/\r?\n/g, '\r\n').toString());
+            })
+
             conn.on("hostkeys", (keys: ParsedKey[]) => {
                 socket.emit(SocketEventConstants.SSH_HOST_KEYS, keys);
             })
@@ -207,7 +220,7 @@ export class SocketListener {
             // sftp_sessions.set(sessionId, sftpIns)
 
             _this.sessions.set(sessionId, conn);
-
+            // this.redisClient.set(`session:${sessionId}`, JSON.stringify(data), {  EX: 3600});
         })
 
         socket.on('disconnect', () => {
@@ -215,7 +228,8 @@ export class SocketListener {
             if (ssh) ssh.end();
             this.sessions.delete(sessionId);
             sftp_sessions.delete(sessionId)
-            console.log(`❌ Disconnected: ${sessionId}`);
+            this.sharedTerminalSessions.delete(sessionId)
+            Logging.dev(`❌ Disconnected: ${sessionId}`);
         });
 
 
