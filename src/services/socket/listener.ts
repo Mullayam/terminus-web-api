@@ -28,10 +28,23 @@ let TerminalSize = {
 }
 const sftp = Sftp_Service.getSftpInstance()
 export const sftp_sessions = new Map<string, SftpInstance>()
+
+type SocketPermission = '400' | '700' | '777';
+
+interface SessionInfo {
+    adminSocketId: string;
+    socketPermissions: Map<string, SocketPermission>;
+    connectedSockets: Set<string>,
+
+}
+
+
+
 export class SocketListener {
     private currentPath = '/';
     private sessions: Map<string, Client> = new Map();
     private sharedTerminalSessions: Map<string, string[]> = new Map();
+    private sessionInfo: Record<string, Partial<SessionInfo>> = {}
     constructor(
         private redisClient: RedisClientType,
         private pubClient: RedisClientType,
@@ -40,9 +53,8 @@ export class SocketListener {
     ) { }
     public onConnection(socket: Socket) {
         const sessionId = socket.handshake.query.sessionId as string;
-        sessionId ? Logging.dev(`🔌 Client connected: ${sessionId} + ${socket.id}`) :
+        sessionId ? Logging.dev(`🔌 Admin connected: ${sessionId} + ${socket.id}`) :
             Logging.dev(`🔌 Client connected: ${socket.id}`);
-
 
         // Listen for SFTP  connections
         this.connectSFTP(socket);
@@ -53,13 +65,43 @@ export class SocketListener {
         // Listen for Multiple session of Terminal Live Sharing operations
         this.terminalSharingSession(socket);
 
-        socket.on('disconnecting', (reason) => { Logging.dev(`SOCKET DISCONNECTING: ${reason}`); });
-        socket.on('disconnect', () => {
-            socket.emit(SocketEventConstants.SSH_DISCONNECTED);
+        socket.on('disconnecting', (reason) => {
+            for (const [sessionId, info] of Object.entries(this.sessionInfo)) {
+                info.adminSocketId && this.io.to(info.adminSocketId)?.emit(SocketEventConstants.SSH_DISCONNECTED, socket.id);
 
-            sftp.end()
+                this.io.to(socket.id)?.emit(SocketEventConstants.SSH_DISCONNECTED, "Session is Terminated by Admin");
 
+
+            }
+
+            Logging.dev(`SOCKET DISCONNECTING: ${reason}`);
         });
+
+        socket.on('disconnect', () => {
+            Logging.dev(`Client disconnected: ${socket.id}`);
+            sftp.end().then(() => Logging.dev(`SFTP Connection Closed`)).catch(err => Logging.dev(`SFTP Connection Error: ${err}`, "error"))
+            for (const [sessionId, info] of Object.entries(this.sessionInfo)) {
+
+                sftp_sessions.delete(sessionId)
+                this.sharedTerminalSessions.delete(sessionId)
+
+                // If admin left or everyone disconnected
+                if (socket.id === info.adminSocketId) {
+                    const ssh = this.sessions.get(sessionId);
+                    if (ssh) ssh.end();
+                    this.sessions.delete(sessionId);
+                    delete this.sessionInfo[sessionId];
+                    this.redisClient.del(`terminal:history:${sessionId}`);
+                    socket.leave(`terminal:${sessionId}`);
+                    Logging.dev(`Admin Disconnected: ${sessionId}`);
+                } else {
+                    info?.socketPermissions?.delete(socket.id)
+                    info?.connectedSockets?.delete(socket.id)
+
+                }
+            }
+        });
+
     }
 
     private terminalSharingSession(socket: Socket) {
@@ -67,13 +109,18 @@ export class SocketListener {
             if (!this.sessions.has(session_id)) {
                 return this.io.to(socket.id).emit(SocketEventConstants.session_not_found, "Session not found");
             }
+            const info = this.sessionInfo[session_id];
+            socket.join(`terminal:${session_id}`);
+            info?.socketPermissions?.set(socket.id, '400')
+            info?.connectedSockets?.add(socket.id)
+
 
             const existingSocketIds = this.sharedTerminalSessions.get(session_id) || [];
 
             if (!existingSocketIds.includes(socket.id)) {
                 existingSocketIds.push(socket.id);
                 this.sharedTerminalSessions.set(session_id, existingSocketIds);
-                this.io.to(socket.id).emit(SocketEventConstants.join_terminal, session_id);
+                info?.adminSocketId && this.io.to(info?.adminSocketId).emit(SocketEventConstants.session_info, { socketId: socket.id, socketIds: Array.from(info?.connectedSockets || []) });
             }
         });
         this.subClient.pSubscribe(`terminal:*`, this.subscribeToSession)
@@ -86,7 +133,6 @@ export class SocketListener {
 
 
         socketIds.forEach((sockId) => {
-
             const targetSocket = _this.io.sockets.sockets.get(sockId);
 
             if (targetSocket) {
@@ -153,11 +199,51 @@ export class SocketListener {
         //     console.log(`⚠️ No resumable session for: ${sessionId}`);
         //     socket.emit('needs-auth');
         // }
+        socket.on(SocketEventConstants.SSH_SESSION, async (input: string) => {
+            const data = JSON.parse(input) as {
+                socketId: string,
+                sessionId: string
+                type: "pause" | "resume" | "kick"
+            }
+            const info = this.sessionInfo[sessionId];
 
+            if (info) {
+                const targetSocket = _this.io.sockets.sockets.get(data.socketId);
+                if (targetSocket) {
+                    switch (data.type) {
+                        case "pause":
+                            targetSocket.emit(SocketEventConstants.session_info, `Your session has been ${data.type} by an admin, click "Resume" to continue`);
+                            targetSocket.disconnect();
+                            break;
+                        case "kick":
+                            targetSocket.emit(SocketEventConstants.SESSIONN_END, `Your session has been terminated by an admin`);
+                            info.connectedSockets?.delete(data.socketId);
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+        })
+        socket.on(SocketEventConstants.SSH_PERMISSIONS, async (input: string) => {
+            const data = JSON.parse(input) as {
+                socketId: string,
+                permissions: SocketPermission,
+                sessionId: string
+            };
+            const info = this.sessionInfo[data.sessionId];
+            if (info) {
+                info.socketPermissions?.set(socket.id, data.permissions);
+                this.io.sockets.sockets.get(data.socketId)?.emit(SocketEventConstants.SSH_PERMISSIONS, input);
+                info.adminSocketId && this.io.sockets.sockets.get(info.adminSocketId)?.emit(SocketEventConstants.SSH_PERMISSIONS, input);
+            }
+        })
         socket.on(SocketEventConstants.SSH_START_SESSION, async (input: string) => {
 
             const data = this.sshConfig(JSON.parse(input));
+
             Logging.dev(`✨ Starting new session: ${sessionId}`);
+            this.sessionInfo[sessionId] = { adminSocketId: socket.id, socketPermissions: new Map(), connectedSockets: new Set() }
             let conn: Client = this.sessions.get(sessionId) || new Client({ captureRejections: true });
 
             conn.on('ready', function () {
@@ -177,7 +263,7 @@ export class SocketListener {
                         const text = data.toString('utf-8')
                         socket.emit(SocketEventConstants.SSH_EMIT_DATA, text);
                         _this.pubClient.publish(`terminal:${sessionId}`, text);
-                        // _this.redisClient.rPush(`logs:${sessionId}`, text);
+                        // _this.redisClient.rPush(`terminal:history:${sessionId}`, text);
 
                     });
                     socket.on(SocketEventConstants.SSH_EMIT_RESIZE, (data) => {
@@ -223,14 +309,6 @@ export class SocketListener {
             // this.redisClient.set(`session:${sessionId}`, JSON.stringify(data), {  EX: 3600});
         })
 
-        socket.on('disconnect', () => {
-            const ssh = this.sessions.get(sessionId);
-            if (ssh) ssh.end();
-            this.sessions.delete(sessionId);
-            sftp_sessions.delete(sessionId)
-            this.sharedTerminalSessions.delete(sessionId)
-            Logging.dev(`❌ Disconnected: ${sessionId}`);
-        });
 
 
     }
@@ -243,8 +321,7 @@ export class SocketListener {
             ABORT_CONTROLLER_MAP.set(name, new AbortController())
             const controller = ABORT_CONTROLLER_MAP.get(name)
             if (controller) {
-                controller.abort()
-                ABORT_CONTROLLER_MAP.delete(name)
+                controller.abort("Cancelled by user")
             }
         }
         socket.on(SocketEventConstants.CANCEL_UPLOADING, progressCancelHandler)

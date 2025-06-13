@@ -9,9 +9,11 @@ export enum SocketEventConstants {
   terminal_input = "@@terminal_input",
   join_terminal = "@@join_terminal",
   session_not_found = "@@session_not_found",
+  session_info = "@@session_info",
 
 
   SSH_START_SESSION = "@@SSH_START_SESSION",
+  SSH_SESSION = "@@SSH_SESSION",
 
   SSH_RESUME = "@@SSH_RESUME",
   SSH_CONNECT = "@@SSH_CONNECT",
@@ -50,7 +52,7 @@ export enum SocketEventConstants {
   FILE_UPLOADED_PROGRESS = "@@FILE_UPLOADED_PROGRESS",
   SFTP_FILE_DOWNLOAD = "@@FILE_DOWNLOAD",
   DOWNLOAD_PROGRESS = "@@DOWNLOAD_PROGRESS",
-  COMPRESSING= "@@COMPRESSING",
+  COMPRESSING = "@@COMPRESSING",
 
   CANCEL_UPLOADING = "@@CANCEL_UPLOADING",
   CANCEL_DOWNLOADING = "@@CANCEL_DOWNLOADING",
