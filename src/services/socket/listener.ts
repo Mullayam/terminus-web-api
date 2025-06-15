@@ -68,10 +68,7 @@ export class SocketListener {
         socket.on('disconnecting', (reason) => {
             for (const [sessionId, info] of Object.entries(this.sessionInfo)) {
                 info.adminSocketId && this.io.to(info.adminSocketId)?.emit(SocketEventConstants.SSH_DISCONNECTED, socket.id);
-
                 this.io.to(socket.id)?.emit(SocketEventConstants.SSH_DISCONNECTED, "Session is Terminated by Admin");
-
-
             }
 
             Logging.dev(`SOCKET DISCONNECTING: ${reason}`);
@@ -218,6 +215,7 @@ export class SocketListener {
                         case "kick":
                             targetSocket.emit(SocketEventConstants.SESSIONN_END, `Your session has been terminated by an admin`);
                             info.connectedSockets?.delete(data.socketId);
+                            targetSocket.disconnect();
                             break;
                         default:
                             break;
