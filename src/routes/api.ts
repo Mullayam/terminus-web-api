@@ -7,7 +7,6 @@ const router = Router();
 router.get('/login', Authentication.default.login);
 router.get('/register', Authentication.default.register);
 router.get('/refresh', Authentication.default.refresh);
-router.get('/init', Authentication.default.initTerminal);
 
 //Terminal
 router.post('/sessions/create', TerminalSession.default.create);
