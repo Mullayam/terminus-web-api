@@ -2,25 +2,40 @@ import { DefaultEventsMap, Server } from "socket.io";
 import type { Server as HttpServer } from 'http'
 import { Logging } from '@enjoys/express-utils/logger';
 import { SocketListener } from "./listener";
+import { createAdapter } from '@socket.io/redis-adapter';
+import { createClient } from 'redis';
+import { __CONFIG__ } from "@/utils/constant";
+
 let socketIo: Server<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, any>;
 
-
-const listner = new SocketListener()
-export const InitSocketConnection = (server: HttpServer) => {
+export const InitSocketConnection = async (server: HttpServer) => {
   Logging.dev("Socket are Initialized")
   const io = new Server(server, {
     connectTimeout: 3000,
     cors: {
-      origin: "*",
-      // origin: process.env.NODE_ENV === 'development' ? process.env.REACT_APP_URL : "*",
+      origin: "*"
     }
   })
-  // io.use((socket, next) => {
-  //   // socket.request.res ? session(socket.request, socket.request.res, next) : next(next); // eslint disable-line
-  // })
+  let pubClient = createClient({ url:  __CONFIG__.REDIS_URL });
+  await pubClient.connect();
+  let subClient = pubClient.duplicate();
+  await subClient.connect();
+  const redisClient = createClient({ url:  __CONFIG__.REDIS_URL });
+  await redisClient.connect();
+
+  io.adapter(createAdapter(pubClient, subClient));
+  Logging.dev('🔌 Redis adapter connected and attached to socket.io', "alert");
+
+  const listner = new SocketListener(
+    redisClient as any,
+    pubClient as any,
+    subClient as any,
+    io,
+  )
+
 
   io.on('connection', (socket) => {
-    listner.onConnection(socket)   
+    listner.onConnection(socket)
   })
 
   socketIo = io

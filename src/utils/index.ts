@@ -5,13 +5,14 @@ import { join } from "path";
 export let Tokens = new Map();
 export let BlacklistedTokens: string[] = [];
 export const SetAppRoutes = new Map();
+
 class Utils {
-    convertBytes(bytes:number) {
+    convertBytes(bytes: number) {
         let result = {
             size: "0",
             unit: 'bytes'
         };
-    
+
         if (bytes < 1024) {
             result = { size: bytes.toFixed(2), unit: 'bytes' };
         } else if (bytes < 1024 * 1024) {
@@ -21,15 +22,15 @@ class Utils {
         } else {
             result = { size: (bytes / (1024 * 1024 * 1024)).toFixed(2), unit: 'GB' };
         }
-    
+
         return result;
     }
-    convertSpeed(speed:number) {
+    convertSpeed(speed: number) {
         let result = {
             speed: "0",
             unit: 'bytes/s'
         };
-    
+
         if (speed < 1024) {
             result = { speed: speed.toFixed(2), unit: 'bytes/s' };
         } else if (speed < 1024 * 1024) {
@@ -39,7 +40,7 @@ class Utils {
         } else {
             result = { speed: (speed / (1024 * 1024 * 1024)).toFixed(2), unit: 'GB/s' };
         }
-    
+
         return result;
     }
     createPath = (currentPath: string) => {

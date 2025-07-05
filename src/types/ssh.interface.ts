@@ -44,6 +44,5 @@ export type SSH_CONFIG_DATA = {
     config: SSH_CONFIG
 }
 export type SSH_RESIZE_WINDOW={
-    uid:string
-    size:{rows: number, cols: number}
+  rows: number, cols: number
 }

@@ -13,8 +13,7 @@ import express, { Application, NextFunction, Response, Request } from 'express'
 import fileUpload from 'express-fileupload';
 import ApiRoutes from './routes/web'
 import { ApplyMiddleware } from './middlewares/all.middlewares';
-import { createProxyMiddleware } from 'http-proxy-middleware';
-import { Socket } from 'net';
+Logging.setLocalAppName("TERMINUS");
 const { ExceptionHandler, UnhandledRoutes } = createHandlers();
 
 class AppServer {
@@ -28,28 +27,7 @@ class AppServer {
         this.ExceptionHandler();
         this.GracefulShutdown()
     }
-    private handleWebSocketProxy(server: http.Server) {
-        const webSocketProxy = createProxyMiddleware({
-            target: 'http://localhost:7555',
-           changeOrigin: true,
-            pathRewrite: { '^/ws': '/' },
-            ws: true,
-            logger: console.log,
-            on: {
-                proxyReqWs: (proxyReq, req, socket, options) => {
-                    Logging.dev(`Proxying WebSocket request for ${req.url}`);
-                }
-            }
-        });
-        server.on('upgrade', (req, socket, head) => {
-            if (req.url?.startsWith('/ws')) {
-                webSocketProxy.upgrade(req, socket as Socket, head);
-            }
-        });
-        return (req: Request, res: Response, next: NextFunction) => {
-            return webSocketProxy(req, res, next);
-        };
-    }
+
     /**
      * Applies the necessary configurations to the AppServer.
      *
@@ -83,7 +61,7 @@ class AppServer {
         Logging.dev("Routes Registered")
         AppServer.App.use(ApiRoutes);
         AppServer.App.use(UnhandledRoutes);
-        RouteResolver.Mapper(AppServer.App, { listEndpoints: true, })
+        RouteResolver.Mapper(AppServer.App as any, { listEndpoints: true, })
     }
     /**
         * ExceptionHandler function.
@@ -112,7 +90,7 @@ class AppServer {
         })
         InitSocketConnection(server)
 
-        AppServer.App.use(this.handleWebSocketProxy(server))
+
         server.on('close', () => {
             this.CloseServer(server)
         })
@@ -130,15 +108,7 @@ class AppServer {
     InitailizeApplication() {
         Logging.dev("Application Dependencies Injected")
         try {
-            /** NOTE  Enable Database Connection
-             * Using InjectRepository Decorator first Db Connection must be initialized otherwise it will throw error that {repository} is undefined
-                *  CreateConnection()
-                .then(() => this.InitServer())
-                .catch(error => {
-                    Logging.dev(error )
-                    process.exit(1)
-                })   
-             */
+           
             this.InitServer()
             return AppServer.App
 

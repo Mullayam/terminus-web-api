@@ -3,15 +3,19 @@ export enum SocketEventConstants {
   Error = "@@Error",
 
   SESSIONN_END = "@@SESSIONN_END",
-
   CreateTerminal = "@@Create_Terminal",
   TerminalUrl = "@@Terminal_Url",
   terminal_output = "@@terminal_output",
   terminal_input = "@@terminal_input",
   join_terminal = "@@join_terminal",
+  session_not_found = "@@session_not_found",
+  session_info = "@@session_info",
 
 
+  SSH_START_SESSION = "@@SSH_START_SESSION",
+  SSH_SESSION = "@@SSH_SESSION",
 
+  SSH_RESUME = "@@SSH_RESUME",
   SSH_CONNECT = "@@SSH_CONNECT",
   SSH_READY = "@@SSH_READY",
   SSH_EMIT_INPUT = "@@SSH_EMIT_INPUT",
@@ -28,7 +32,9 @@ export enum SocketEventConstants {
   SSH_PERMISSIONS = "@@SSH_PERMISSIONS",
 
   // SFTP
+  SFTP_CURRENT_PATH = "@@SFTP_CURRENT_PATH",
   SFTP_CONNECT = "@@SFTP_CONNECT",
+  SFTP_EMIT_ERROR = "@@SFTP_EMIT_ERROR",
   SFTP_READY = "@@SFTP_READY",
   SFTP_GET_FILE = "@@SFTP_GET_FILE",
   SFTP_FILES_LIST = "@@SFTP_FILES_LIST",
@@ -45,7 +51,11 @@ export enum SocketEventConstants {
   FILE_UPLOADED = "@@FILE_UPLOADED",
   FILE_UPLOADED_PROGRESS = "@@FILE_UPLOADED_PROGRESS",
   SFTP_FILE_DOWNLOAD = "@@FILE_DOWNLOAD",
+  DOWNLOAD_PROGRESS = "@@DOWNLOAD_PROGRESS",
+  COMPRESSING = "@@COMPRESSING",
 
+  CANCEL_UPLOADING = "@@CANCEL_UPLOADING",
+  CANCEL_DOWNLOADING = "@@CANCEL_DOWNLOADING",
 
   SUCCESS = "@@SUCCESS",
   ERROR = "@@ERROR"
