@@ -1,6 +1,6 @@
 export enum SocketEventConstants {
   ServerClosed = "@@ServerClosed",
-  Error = "@@Error",
+  ServerError = "@@ServerError",
 
   SESSIONN_END = "@@SESSIONN_END",
   CreateTerminal = "@@Create_Terminal",
@@ -51,6 +51,9 @@ export enum SocketEventConstants {
   FILE_UPLOADED = "@@FILE_UPLOADED",
   FILE_UPLOADED_PROGRESS = "@@FILE_UPLOADED_PROGRESS",
   SFTP_FILE_DOWNLOAD = "@@FILE_DOWNLOAD",
+  SFTP_EDIT_FILE_DONE = "@@SFTP_EDIT_FILE_DONE",
+  SFTP_EDIT_FILE_REQUEST = "@@SFTP_EDIT_FILE_REQUEST",
+  SFTP_EDIT_FILE_REQUEST_RESPONSE = "@@SFTP_EDIT_FILE_REQUEST_RESPONSE",
   DOWNLOAD_PROGRESS = "@@DOWNLOAD_PROGRESS",
   COMPRESSING = "@@COMPRESSING",
 

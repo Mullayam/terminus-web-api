@@ -1,9 +1,9 @@
 import * as http from 'http'
+import * as os from 'os'
 import morgan from 'morgan'
 import helmet from 'helmet';
 import cors from 'cors'
 import { Logging } from '@enjoys/express-utils/logger';
-import bodyParser from 'body-parser';
 import { blue } from 'colorette';
 import cookieParser from 'cookie-parser';
 import { createHandlers } from '@enjoys/exception';
@@ -13,12 +13,13 @@ import express, { Application, NextFunction, Response, Request } from 'express'
 import fileUpload from 'express-fileupload';
 import ApiRoutes from './routes/web'
 import { ApplyMiddleware } from './middlewares/all.middlewares';
+import { __CONFIG__ } from './utils/constant';
 Logging.setLocalAppName("TERMINUS");
 const { ExceptionHandler, UnhandledRoutes } = createHandlers();
 
 class AppServer {
     static App: Application = express();
-    static PORT: number = +7145;
+    static PORT: number = __CONFIG__.PORT;
 
     constructor() {
         AppServer.App.use(ApplyMiddleware("setHeaders"));
@@ -42,19 +43,19 @@ class AppServer {
         AppServer.App.use(morgan("dev"));
         AppServer.App.use(cookieParser());
         AppServer.App.use(cors({
-            origin: "*",
+            origin: __CONFIG__.FRONTEND_URL || "*",
             optionsSuccessStatus: 200,
             methods: ["GET", "POST", "PUT", "DELETE"],
             allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization", "Sessionid"],
             credentials: true
         }));
-        AppServer.App.use(bodyParser.json());
+        AppServer.App.use(express.json());
         AppServer.App.use(fileUpload({
             useTempFiles: true,
-            tempFileDir: '/tmp/',
+            tempFileDir: os.tmpdir(),
         }));
         AppServer.App.set('timeout', 0)
-        AppServer.App.use(bodyParser.urlencoded({ extended: false }));
+        AppServer.App.use(express.urlencoded({ extended: false }));
     }
     private RegisterRoutes() {
         Logging.dev("Registering Routes")
@@ -105,7 +106,7 @@ class AppServer {
     /**
         * Initializes the application. 
     */
-    InitailizeApplication() {
+    InitializeApplication() {
         Logging.dev("Application Dependencies Injected")
         try {
            

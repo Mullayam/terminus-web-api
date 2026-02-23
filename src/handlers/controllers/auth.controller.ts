@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'child_process'
+import { spawn } from 'child_process'
 import type { Response, Request } from 'express'
 import { platform } from 'os'
 class AuthController {
@@ -15,12 +15,10 @@ class AuthController {
         } catch (err) {
             res.json({
                 status: false,
-                message: 'Login Successful',
-                result: {
-                    token: 'your_jwt_token'
-                }
+                message: err instanceof Error ? err.message : 'Login Failed',
+                result: null
             })
-
+            return
         }
     }
 
@@ -41,12 +39,14 @@ class AuthController {
                     message: err.message,
                     result: null
                 })
+                return
             }
             res.json({
                 status: false,
                 message: "Something Went Wrong",
                 result: null
             })
+            return
 
         }
     }
@@ -65,13 +65,14 @@ class AuthController {
                     message: err.message,
                     result: null
                 })
+                return
             }
             res.json({
                 status: false,
                 message: "Something Went Wrong",
                 result: null
             })
-
+            return
         }
     }
     async initTerminal(req: Request, res: Response) {
@@ -87,11 +88,12 @@ class AuthController {
             }
 
             if (!command) {
-                return res.status(400).json({
+                res.status(400).json({
                     status: false,
                     message: 'Unsupported platform',
                     result: null
                 });
+                return
             }
 
             // Ensure the Linux binary has execute permission
@@ -124,19 +126,20 @@ class AuthController {
             });
 
             child.on('error', (err) => {
-                return res.status(500).json({
+                res.status(500).json({
                     status: false,
                     message: err.message,
                     result: null
                 });
             });
-
+            return
         } catch (err: any) {
-            return res.status(500).json({
+            res.status(500).json({
                 status: false,
                 message: err instanceof Error ? err.message : 'Something Went Wrong',
                 result: null
             });
+            return
         }
     }
 }

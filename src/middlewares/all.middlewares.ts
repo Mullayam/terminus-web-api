@@ -1,4 +1,5 @@
 import { Logging } from '@enjoys/express-utils/logger';
+import { timingSafeEqual } from 'crypto';
 import { Request, Response, NextFunction, RequestHandler } from 'express';
 class AllMiddlewares {
 
@@ -39,7 +40,9 @@ class AllMiddlewares {
             res.end();
             return
         }
-        if (apiKey !== process.env.API_KEY) {
+        if (!process.env.API_KEY || typeof apiKey !== 'string' ||
+            apiKey.length !== process.env.API_KEY.length ||
+            !timingSafeEqual(Buffer.from(apiKey), Buffer.from(process.env.API_KEY))) {
             res.status(401).json({
                 success: false,
                 status_code: {

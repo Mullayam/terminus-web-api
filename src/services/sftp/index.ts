@@ -8,7 +8,7 @@ const sftp = new SFTPClient();
         try {
             await sftp.connect(options);
             this.is_connected = true
-            Logging.dev('Connected to SFTP server');
+            Logging.dev('Connected to SFTP server 11');
         } catch (err) {
             Logging.dev('SFTP Connection Error:' + err, "error");
         }
