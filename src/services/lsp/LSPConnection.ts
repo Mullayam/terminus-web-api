@@ -1,5 +1,5 @@
 // LSPConnection.ts
-import { LSPProcess } from "./lspProcess";
+import { LSPProcess } from "./LSPProcess";
 
 export class LSPConnection {
   constructor(private lsp: LSPProcess) {}

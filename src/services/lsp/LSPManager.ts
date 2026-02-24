@@ -1,5 +1,5 @@
 // LSPManager.ts
-import { LSPProcess } from "./lspProcess";
+import { LSPProcess } from "./LSPProcess";
 import { LSPConnection } from "./LSPConnection";
 
 export class LSPManager {
