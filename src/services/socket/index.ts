@@ -5,6 +5,7 @@ import { SocketListener } from "./listener";
 import { createAdapter } from '@socket.io/redis-adapter';
 import { createClient } from 'redis';
 import { __CONFIG__ } from "@/utils/constant";
+import { DedicatedTerminal } from "./dedicated-terminal";
 
 let socketIo: Server<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, any>;
 
@@ -37,7 +38,9 @@ export const InitSocketConnection = async (server: HttpServer) => {
   io.on('connection', (socket) => {
     listner.onConnection(socket)
   })
-
+  io.of("/dedicated-terminal").on("connection", (socket) => {
+    new DedicatedTerminal(socket, redisClient as any);
+  });
   socketIo = io
   return io
 };

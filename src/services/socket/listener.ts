@@ -1,14 +1,9 @@
 import fs from "fs";
 import { join, posix } from "path";
 import AdmZip from "adm-zip";
-
 import { Server } from "socket.io";
-
 import { Client, ParsedKey } from "ssh2";
-
 import { Socket } from "socket.io";
-
-import { SSH_CONFIG_DATA, SSH_HANDSHAKE } from "../../types/ssh.interface";
 import { SocketEventConstants } from "./events";
 import { Logging } from "@enjoys/express-utils/logger";
 import { FileOperationPayload, EditFilePayload } from "../../types/file-upload";
@@ -136,7 +131,7 @@ export class SocketListener {
                         );
                     sftp_sessions.delete(sessionId);
                 }
-
+                this.redisClient.del(`sftp:${socket.handshake.query.sessionId}`);
                 this.sharedTerminalSessions.delete(sessionId);
 
                 // If admin left or everyone disconnected
@@ -712,6 +707,7 @@ export class SocketListener {
                     files: JSON.stringify(files),
                     currentDir: this.currentPath,
                 });
+                this.redisClient.set(`sftp:${socket.handshake.query.sessionId}`, data);
                 socket.emit(SocketEventConstants.SFTP_CURRENT_PATH, this.currentPath);
             } catch (err: any) {
                 Logging.dev(`SFTP_CONNECT error: ${err.message}`, "error");
