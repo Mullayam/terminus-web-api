@@ -11,3 +11,7 @@ export interface UploadedFile {
     name: string;
     data: Buffer;
 }
+export interface EditFilePayload {
+    content: string;
+    path: string;
+}

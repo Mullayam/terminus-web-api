@@ -6,7 +6,7 @@ register({ baseUrl: __dirname, paths: tsConfig.paths })
 import { bootstrap } from "./src/application";
 
 function main() {
-    const app = bootstrap.AppServer.InitailizeApplication()!
+    const app = bootstrap.AppServer.InitializeApplication()!
     const options = {
         dotfiles: 'ignore',
         etag: false,

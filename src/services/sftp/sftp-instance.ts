@@ -3,7 +3,7 @@ import SFTPClient from 'ssh2-sftp-client';
 import { SocketEventConstants } from '../socket/events';
 import { Socket } from 'socket.io';
 import fs from 'fs';
-import { join } from 'path';
+import { join, posix } from 'path';
 import AdmZip from 'adm-zip';
 
 import { FileOperationPayload } from '../../types/file-upload';
@@ -20,7 +20,7 @@ export class SftpInstance {
         return this.sftp.connect(options).then(() => {
             this.sftpOperation()
             this.socket.emit(SocketEventConstants.SFTP_READY, true);
-            Logging.dev('Connected to SFTP server');
+            Logging.dev('Connected to SFTP server 23');
         }).catch((err) => {
             Logging.dev("Error opening SFTP connection: " + err.message, "error");
             this.socket.emit(SocketEventConstants.SFTP_EMIT_ERROR, 'Error opening SFTP connection: ' + err.message);
@@ -60,7 +60,7 @@ export class SftpInstance {
 
                 for (const file of extractedFiles) {
                     const localFilePath = join(extractDir, file);
-                    const remoteFilePath = join(dirPath, file);
+                    const remoteFilePath = posix.join(dirPath, file);
 
                     const fileStat = fs.statSync(localFilePath);
                     if (fileStat.isFile()) {
@@ -180,8 +180,11 @@ export class SftpInstance {
             if (!path) return socket.emit(SocketEventConstants.ERROR, 'Invalid  path');
 
             try {
-
-                await sftp.downloadDir(path, "",);
+                const localDownloadPath = join(process.cwd(), 'storage', 'downloads');
+                if (!fs.existsSync(localDownloadPath)) {
+                    fs.mkdirSync(localDownloadPath, { recursive: true });
+                }
+                await sftp.downloadDir(path, localDownloadPath);
                 socket.emit(SocketEventConstants.SUCCESS, 'Folder Downloaded successfully');
             } catch (err) {
                 socket.emit(SocketEventConstants.ERROR, 'Error Downloading folder');

@@ -1,10 +1,8 @@
 import type { Response, Request } from 'express'
 
-class TerminalSessionController { 
-    async create (req: Request, res: Response) {
+class TerminalSessionController {
+    async create(req: Request, res: Response) {
         try {
-            let sessionId = '';
-
             res.json({
                 status: true,
                 message: '',
@@ -18,16 +16,17 @@ class TerminalSessionController {
                     message: err.message,
                     result: null
                 })
+                return
             }
             res.json({
                 status: false,
                 message: "Something Went Wrong",
                 result: null
             })
-
+            return
         }
     }
-    async getSingleSession (req: Request, res: Response) {
+    async getSingleSession(req: Request, res: Response) {
         try {
             res.json({
                 status: true,
@@ -42,16 +41,17 @@ class TerminalSessionController {
                     message: err.message,
                     result: null
                 })
+                return
             }
             res.json({
                 status: false,
                 message: "Something Went Wrong",
                 result: null
             })
-
+            return
         }
     }
-    async updatePermission (req: Request, res: Response) {
+    async updatePermission(req: Request, res: Response) {
         try {
             res.json({
                 status: true,
@@ -66,16 +66,17 @@ class TerminalSessionController {
                     message: err.message,
                     result: null
                 })
+                return
             }
             res.json({
                 status: false,
                 message: "Something Went Wrong",
                 result: null
             })
-
+            return
         }
     }
-    async deleteSession (req: Request, res: Response) {
+    async deleteSession(req: Request, res: Response) {
         try {
             res.json({
                 status: true,
@@ -90,13 +91,14 @@ class TerminalSessionController {
                     message: err.message,
                     result: null
                 })
+                return
             }
             res.json({
                 status: false,
                 message: "Something Went Wrong",
                 result: null
             })
-
+            return
         }
     }
 }

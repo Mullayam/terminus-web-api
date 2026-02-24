@@ -1,4 +1,5 @@
-import { basename, join, } from 'path';
+import { basename, join } from 'path';
+import path from 'path';
 import type { Response, Request } from 'express'
 import { UploadedFile as ExpressUploadedFile } from 'express-fileupload';
 import { Sftp_Service } from '@services/sftp';
@@ -6,11 +7,10 @@ import { getSocketIo } from '@/services/socket';
 import { SocketEventConstants } from '@/services/socket/events';
 import { createReadStream, existsSync, mkdirSync, rm, } from 'fs'
 import archiver from 'archiver';
-const sftp = Sftp_Service.getSftpInstance()
 import progress from 'progress-stream'
 import utils from '@/utils';
-import { Readable } from 'stream';
-import Busboy from 'busboy';
+
+const getSftp = () => Sftp_Service.getSftpInstance();
 
 const uploadPath = join(process.cwd(), 'storage');
 export const ABORT_CONTROLLER_MAP = new Map<string, AbortController>()
@@ -93,7 +93,10 @@ class SFTPController {
     // }
 
     async handleUpload(req: Request, res: Response) {
-        const signal = new AbortController().signal
+        const abortController = new AbortController();
+        const uploadId = Date.now().toString();
+        ABORT_CONTROLLER_MAP.set(uploadId, abortController);
+        const signal = abortController.signal;
 
         if (!req.files) {
             res.status(400).send('No file uploaded');
@@ -123,7 +126,7 @@ class SFTPController {
                 }
 
                 // Upload directory with filter
-                await sftp.uploadDir(dirPath, path, {
+                await getSftp().uploadDir(dirPath, path, {
                     filter: (filePath: string) => {
                         const name = basename(filePath);
                         return !filePath.includes('.git') && !filePath.includes('node_modules') && !name.startsWith('.');
@@ -189,7 +192,7 @@ class SFTPController {
                 });
             });
 
-            await sftp.put(streamWithProgress, remotePath);
+            await getSftp().put(streamWithProgress, remotePath);
             getSocketIo().emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
                 percent: 100,
                 transferred: progressStream.progress().transferred || 0,
@@ -234,20 +237,20 @@ class SFTPController {
             }
             const remotePath = body.remotePath
             const localPath = join(process.cwd(), 'storage', basename(remotePath))
-            await sftp.realPath(remotePath);
+            await getSftp().realPath(remotePath);
 
             const abortController = new AbortController();
             ABORT_CONTROLLER_MAP.set(body.name, abortController);
 
             const signal = abortController.signal
 
-            const stats = await sftp.stat(remotePath)
+            const stats = await getSftp().stat(remotePath)
 
             if (body.type === "file") {
 
                 const totalSize = stats.size;
 
-                const stream = sftp.createReadStream(remotePath);
+                const stream = getSftp().createReadStream(remotePath);
 
                 const str = progress({
                     length: totalSize,
@@ -310,7 +313,7 @@ class SFTPController {
             }
 
             else {
-                const fileList = await sftp.list(remotePath, (fileInfo) => {
+                const fileList = await getSftp().list(remotePath, (fileInfo) => {
                     return !fileInfo.name.includes('.git') &&
                         !fileInfo.name.includes('node_modules') &&
                         !fileInfo.name.includes('build') &&
@@ -354,7 +357,7 @@ class SFTPController {
                     if (signal.aborted) break;
 
                     const remoteFilePath = `${remotePath}/${file.name}`;
-                    const readStream = sftp.createReadStream(remoteFilePath);
+                    const readStream = getSftp().createReadStream(remoteFilePath);
 
                     const fileProgress = progress({
                         length: file.size,
@@ -403,17 +406,18 @@ class SFTPController {
                             remaining: utils.convertBytes(totalSize - downloaded),
 
                         });
-                        res.end();
+                        getSocketIo().emit(SocketEventConstants.SUCCESS, `${body.name}.zip Downloaded Successfully`);
                     }
                 });
 
-
+                return;
             }
 
-            getSocketIo().emit(SocketEventConstants.SUCCESS, `${body.name}.zip Downloaded Successfully`);
             return
         } catch (err: any) {
-            res.json({ status: false, message: err.message, result: null })
+            if (!res.headersSent) {
+                res.json({ status: false, message: err.message, result: null })
+            }
             getSocketIo().emit(SocketEventConstants.ERROR, "Error in Downloading");
 
         }
