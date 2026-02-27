@@ -10,7 +10,18 @@ import archiver from "archiver";
 import progress from "progress-stream";
 import utils from "@/utils";
 
-const getSftp = () => Sftp_Service.getSftpInstance();
+/**
+ * Resolve the SFTPClient for a given session.
+ * Looks for `sftpSessionId` first, falls back to `sessionId`.
+ */
+const getSftp = (req: Request) => {
+    const id = (req.body?.sftpSessionId ?? req.query?.sftpSessionId ??
+                req.body?.sessionId ?? req.query?.sessionId) as string | undefined;
+    if (!id) throw new Error("sftpSessionId or sessionId is required");
+    const client = Sftp_Service.getSession(id);
+    if (!client) throw new Error(`No SFTP session found for id: ${id}`);
+    return client;
+};
 
 const uploadPath = join(process.cwd(), "storage");
 export const ABORT_CONTROLLER_MAP = new Map<string, AbortController>();
@@ -92,32 +103,20 @@ class SFTPController {
         try {
             const body = req.body as {
                 sessionId: string;
+                sftpSessionId?: string;
                 path: string;
                 content: string;
             };
-            Sftp_Service.sessions
-                .get(body.sessionId)
-                ?.put(Buffer.from(body.content), body.path)
-                .then(() => {
-                    res.json({
-                        status: true,
-                        message: "File written successfully",
-                        result: null,
-                    });
-                })
-                .catch((err) => {
-                    res.status(500).json({
-                        status: false,
-                        message: err.message || "Error reading file",
-                        result: null,
-                    });
-                });
-        } catch (error) {
-            res.status(500).json({
-                status: false,
-                message: "Error reading file",
-                result: null,
-            });
+            const id = body.sftpSessionId ?? body.sessionId;
+            const client = Sftp_Service.getSession(id);
+            if (!client) {
+                res.status(404).json({ status: false, message: `No SFTP session: ${id}`, result: null });
+                return;
+            }
+            await client.put(Buffer.from(body.content), body.path);
+            res.json({ status: true, message: "File written successfully", result: null });
+        } catch (error: any) {
+            res.status(500).json({ status: false, message: error.message || "Error writing file", result: null });
         }
     }
     async handleFileRead(req: Request, res: Response) {
@@ -125,30 +124,18 @@ class SFTPController {
             const body = req.body as {
                 path: string;
                 sessionId: string;
+                sftpSessionId?: string;
             };
-            Sftp_Service.sessions
-                .get(body.sessionId)
-                ?.get(body.path)
-                .then((data) => {
-                    res.json({
-                        status: true,
-                        message: "File read successfully",
-                        result: data.toString(),
-                    });
-                })
-                .catch((err) => {
-                    res.status(500).json({
-                        status: false,
-                        message: err.message || "Error reading file",
-                        result: null,
-                    });
-                });
-        } catch (error) {
-            res.status(500).json({
-                status: false,
-                message: "Error reading file",
-                result: null,
-            });
+            const id = body.sftpSessionId ?? body.sessionId;
+            const client = Sftp_Service.getSession(id);
+            if (!client) {
+                res.status(404).json({ status: false, message: `No SFTP session: ${id}`, result: null });
+                return;
+            }
+            const data = await client.get(body.path);
+            res.json({ status: true, message: "File read successfully", result: data.toString() });
+        } catch (error: any) {
+            res.status(500).json({ status: false, message: error.message || "Error reading file", result: null });
         }
     }
 
@@ -186,7 +173,7 @@ class SFTPController {
                 }
 
                 // Upload directory with filter
-                await getSftp().uploadDir(dirPath, path, {
+                await getSftp(req).uploadDir(dirPath, path, {
                     filter: (filePath: string) => {
                         const name = basename(filePath);
                         return (
@@ -258,7 +245,7 @@ class SFTPController {
                 });
             });
 
-            await getSftp().put(streamWithProgress, remotePath);
+            await getSftp(req).put(streamWithProgress, remotePath);
             getSocketIo().emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
                 percent: 100,
                 transferred: progressStream.progress().transferred || 0,
@@ -291,9 +278,7 @@ class SFTPController {
 
     async handleDownload(req: Request, res: Response) {
         try {
-            if (!Sftp_Service.is_connected) {
-                throw new Error("Error in Downloading Content");
-            }
+            const sftp = getSftp(req);
             const body = req.body as {
                 remotePath: string;
                 type: "dir" | "file";
@@ -304,19 +289,19 @@ class SFTPController {
             }
             const remotePath = body.remotePath;
             const localPath = join(process.cwd(), "storage", basename(remotePath));
-            await getSftp().realPath(remotePath);
+            await sftp.realPath(remotePath);
 
             const abortController = new AbortController();
             ABORT_CONTROLLER_MAP.set(body.name, abortController);
 
             const signal = abortController.signal;
 
-            const stats = await getSftp().stat(remotePath);
+            const stats = await sftp.stat(remotePath);
 
             if (body.type === "file") {
                 const totalSize = stats.size;
 
-                const stream = getSftp().createReadStream(remotePath);
+                const stream = sftp.createReadStream(remotePath);
 
                 const str = progress({
                     length: totalSize,
@@ -375,7 +360,7 @@ class SFTPController {
                 stream.pipe(str).pipe(res);
                 return;
             } else {
-                const fileList = await getSftp().list(remotePath, (fileInfo) => {
+                const fileList = await sftp.list(remotePath, (fileInfo) => {
                     return (
                         !fileInfo.name.includes(".git") &&
                         !fileInfo.name.includes("node_modules") &&
@@ -424,7 +409,7 @@ class SFTPController {
                     if (signal.aborted) break;
 
                     const remoteFilePath = `${remotePath}/${file.name}`;
-                    const readStream = getSftp().createReadStream(remoteFilePath);
+                    const readStream = sftp.createReadStream(remoteFilePath);
 
                     const fileProgress = progress({
                         length: file.size,

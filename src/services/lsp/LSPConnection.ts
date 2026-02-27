@@ -10,29 +10,35 @@ export class LSPConnection {
         uri,
         languageId: language,
         version: 1,
-        text: content
-      }
+        text: content,
+      },
     });
   }
 
   changeDocument(uri: string, version: number, content: string) {
     this.lsp.sendNotification("textDocument/didChange", {
       textDocument: { uri, version },
-      contentChanges: [{ text: content }]
+      contentChanges: [{ text: content }],
     });
   }
 
   async completion(uri: string, position: any) {
     return this.lsp.sendRequest("textDocument/completion", {
       textDocument: { uri },
-      position
+      position,
     });
   }
 
   async hover(uri: string, position: any) {
     return this.lsp.sendRequest("textDocument/hover", {
       textDocument: { uri },
-      position
+      position,
+    });
+  }
+
+  closeDocument(uri: string) {
+    this.lsp.sendNotification("textDocument/didClose", {
+      textDocument: { uri },
     });
   }
 }

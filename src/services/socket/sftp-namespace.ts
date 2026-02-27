@@ -1,0 +1,358 @@
+import SFTPClient from "ssh2-sftp-client";
+import { Socket } from "socket.io";
+import { RedisClientType } from "redis";
+import fs from "fs";
+import { join, posix, basename } from "path";
+import AdmZip from "adm-zip";
+import { Logging } from "@enjoys/express-utils/logger";
+import { SocketEventConstants } from "./events";
+import { Sftp_Service } from "../sftp";
+import { FileOperationPayload, EditFilePayload } from "../../types/file-upload";
+import { parseSSHConfig } from "./parse-ssh-config";
+
+const E = SocketEventConstants;
+
+/**
+ * SFTP Socket Namespace  –  /sftp
+ *
+ * Every socket that connects to this namespace gets its **own** SFTPClient
+ * instance, so a user can open multiple SFTP panels to the same or different
+ * hosts simultaneously.
+ *
+ * Handshake query params:
+ *   sessionId : the main terminal/SSH session id (used to look up saved creds in Redis)
+ *
+ * The per-socket SFTP session is identified by `socket.id` internally.
+ *
+ * ─── Client → Server ──────────────────────────────────────────────────────
+ *   @@SFTP_CONNECT              { host, port?, username, authMethod, password?, privateKeyText? }
+ *   @@SFTP_GET_FILE             { dirPath? }
+ *   @@SFTP_RENAME_FILE          { oldPath, newPath }
+ *   @@SFTP_MOVE_FILE            { oldPath, newPath }
+ *   @@SFTP_COPY_FILE            { currentPath, destinationPath }
+ *   @@SFTP_DELETE_FILE           { path }
+ *   @@SFTP_DELETE_DIR            { path }
+ *   @@SFTP_CREATE_FILE           { filePath }
+ *   @@SFTP_CREATE_DIR            { folderPath }
+ *   @@SFTP_EXISTS               { dirPath }
+ *   @@SFTP_FILE_STATS           { path }
+ *   @@SFTP_FILE_DOWNLOAD        { path }
+ *   @@SFTP_ZIP_EXTRACT          { dirPath }
+ *   @@SFTP_EDIT_FILE_REQUEST    { path }
+ *   @@SFTP_EDIT_FILE_DONE       { path, content }
+ *
+ * ─── Server → Client ──────────────────────────────────────────────────────
+ *   @@SFTP_READY                true
+ *   @@SFTP_CURRENT_PATH         string
+ *   @@SFTP_FILES_LIST           { files, currentDir }
+ *   @@SFTP_EMIT_ERROR           string
+ *   @@SFTP_ENDED                string
+ *   @@SFTP_EDIT_FILE_REQUEST_RESPONSE  string
+ *   @@SFTP_FILE_STATS           stats object
+ *   @@FILE_UPLOADED             string
+ *   @@SUCCESS                   string
+ *   @@ERROR                     string
+ */
+export class SFTPNamespace {
+    private sftp!: SFTPClient;
+    private sftpSessionId: string;
+    private sessionId: string;
+    private currentPath = "/";
+
+    constructor(
+        private readonly socket: Socket,
+        private readonly redisClient: RedisClientType,
+    ) {
+        this.sftpSessionId = socket.id; // each socket = independent sftp session
+        this.sessionId = (socket.handshake.query.sessionId as string) ?? socket.id;
+        Logging.dev(`[SFTP:ns] Client connected: ${socket.id}  session=${this.sessionId}`);
+        this.registerEvents();
+    }
+
+    /* ─── helpers ──────────────────────────────────────────────────────── */
+
+    private getSftp(): SFTPClient {
+        if (!this.sftp) throw new Error("SFTP not connected");
+        return this.sftp;
+    }
+
+    /* ─── event registration ──────────────────────────────────────────── */
+
+    private registerEvents() {
+        const { socket } = this;
+
+        // ── Connect ──────────────────────────────────────────────────────
+        socket.on(E.SFTP_CONNECT, async (data: any) => {
+            try {
+                let config: any;
+
+                if (data && data.host) {
+                    // Explicit credentials from client
+                    config = parseSSHConfig(data);
+                } else {
+                    // Fall back to Redis-stored creds from the main session
+                    const raw = await this.redisClient.get(`sftp:${this.sessionId}`);
+                    if (!raw) {
+                        socket.emit(E.SFTP_EMIT_ERROR, "No stored credentials and no credentials provided");
+                        return;
+                    }
+                    config = parseSSHConfig(typeof raw === "string" ? JSON.parse(raw) : raw);
+                }
+
+                const client = await Sftp_Service.connectSFTP(config, this.sftpSessionId);
+                this.sftp = client;
+
+                // Bind lifecycle events for this session
+                Sftp_Service.emitSftpEvent(this.sftpSessionId, socket);
+
+                socket.emit(E.SFTP_READY, true);
+
+                // Send initial listing
+                this.currentPath = await client.cwd();
+                const files = await client.list(this.currentPath);
+                socket.emit(E.SFTP_FILES_LIST, {
+                    files: JSON.stringify(files),
+                    currentDir: this.currentPath,
+                });
+                socket.emit(E.SFTP_CURRENT_PATH, this.currentPath);
+
+                // Store creds in Redis for reconnect / controller use
+                if (data && data.host) {
+                    await this.redisClient.set(
+                        `sftp:${this.sessionId}`,
+                        typeof data === "string" ? data : JSON.stringify(data),
+                    );
+                }
+            } catch (err: any) {
+                Logging.dev(`[SFTP:ns] connect error: ${err.message}`, "error");
+                socket.emit(E.SFTP_EMIT_ERROR, "SFTP connection error: " + err.message);
+            }
+        });
+
+        // ── List directory ───────────────────────────────────────────────
+        socket.on(E.SFTP_GET_FILE, async (payload: FileOperationPayload): Promise<any> => {
+            try {
+                const sftp = this.getSftp();
+                let dirPath = payload?.dirPath;
+                if (!dirPath) {
+                    dirPath = await sftp.cwd() as string;
+                }
+                this.currentPath = dirPath;
+                const files = await sftp.list(dirPath);
+                socket.emit(E.SFTP_FILES_LIST, {
+                    files: JSON.stringify(files),
+                    currentDir: dirPath,
+                });
+            } catch (err: any) {
+                socket.emit(E.ERROR, "Error fetching files: " + err.message);
+            }
+        });
+
+        // ── File exists ──────────────────────────────────────────────────
+        socket.on(E.SFTP_EXISTS, async (payload: FileOperationPayload): Promise<any> => {
+            try {
+                const { dirPath } = payload;
+                if (!dirPath) return socket.emit(E.ERROR, "Invalid directory path");
+                const sftp = this.getSftp();
+                const isExists = await sftp.exists(dirPath);
+                if (!isExists) {
+                    socket.emit(E.ERROR, "File not found");
+                    return;
+                }
+                socket.emit(E.SFTP_FILES_LIST, isExists);
+            } catch (err: any) {
+                socket.emit(E.ERROR, "Error checking existence: " + err.message);
+            }
+        });
+
+        // ── Copy file ────────────────────────────────────────────────────
+        socket.on(E.SFTP_COPY_FILE, async (payload: { currentPath: string; destinationPath: string }): Promise<any> => {
+            try {
+                const { currentPath, destinationPath } = payload;
+                if (!currentPath || !destinationPath) return socket.emit(E.ERROR, "Invalid path");
+                const sftp = this.getSftp();
+                await sftp.rcopy(currentPath, destinationPath);
+                socket.emit(E.SUCCESS, "File copied successfully");
+            } catch (err: any) {
+                socket.emit(E.ERROR, "Error copying file: " + err.message);
+            }
+        });
+
+        // ── Rename ───────────────────────────────────────────────────────
+        socket.on(E.SFTP_RENAME_FILE, async (payload: FileOperationPayload): Promise<any> => {
+            try {
+                const { oldPath, newPath } = payload;
+                if (!oldPath || !newPath) return socket.emit(E.ERROR, "Invalid file paths");
+                await this.getSftp().rename(oldPath, newPath);
+                socket.emit(E.SUCCESS, "File renamed successfully");
+            } catch (err: any) {
+                socket.emit(E.ERROR, "Error renaming file: " + err.message);
+            }
+        });
+
+        // ── Move ─────────────────────────────────────────────────────────
+        socket.on(E.SFTP_MOVE_FILE, async (payload: FileOperationPayload): Promise<any> => {
+            try {
+                const { oldPath, newPath } = payload;
+                if (!oldPath || !newPath) return socket.emit(E.ERROR, "Invalid file paths");
+                await this.getSftp().rename(oldPath, newPath);
+                socket.emit(E.SUCCESS, "File moved successfully");
+            } catch (err: any) {
+                socket.emit(E.ERROR, "Error moving file: " + err.message);
+            }
+        });
+
+        // ── Create file ──────────────────────────────────────────────────
+        socket.on(E.SFTP_CREATE_FILE, async (payload: FileOperationPayload): Promise<any> => {
+            try {
+                const { filePath } = payload;
+                if (!filePath) return socket.emit(E.ERROR, "Invalid file path");
+                await this.getSftp().put(Buffer.from(""), filePath);
+                socket.emit(E.SUCCESS, "File created successfully");
+            } catch (err: any) {
+                socket.emit(E.ERROR, "Error creating file: " + err.message);
+            }
+        });
+
+        // ── Create directory ─────────────────────────────────────────────
+        socket.on(E.SFTP_CREATE_DIR, async (payload: FileOperationPayload): Promise<any> => {
+            try {
+                const { folderPath } = payload;
+                if (!folderPath) return socket.emit(E.ERROR, "Invalid folder path");
+                await this.getSftp().mkdir(folderPath, true);
+                socket.emit(E.SUCCESS, "Folder created successfully");
+            } catch (err: any) {
+                socket.emit(E.ERROR, "Error creating folder: " + err.message);
+            }
+        });
+
+        // ── Download directory ───────────────────────────────────────────
+        socket.on(E.SFTP_FILE_DOWNLOAD, async (payload: FileOperationPayload): Promise<any> => {
+            try {
+                const { path } = payload;
+                if (!path) return socket.emit(E.ERROR, "Invalid path");
+                const localDownloadPath = join(process.cwd(), "storage", "downloads");
+                if (!fs.existsSync(localDownloadPath)) {
+                    fs.mkdirSync(localDownloadPath, { recursive: true });
+                }
+                await this.getSftp().downloadDir(path, localDownloadPath);
+                socket.emit(E.SUCCESS, "Folder Downloaded successfully");
+            } catch (err: any) {
+                socket.emit(E.ERROR, "Error Downloading folder: " + err.message);
+            }
+        });
+
+        // ── File stats ───────────────────────────────────────────────────
+        socket.on(E.SFTP_FILE_STATS, async (payload: FileOperationPayload): Promise<any> => {
+            try {
+                const { path } = payload;
+                if (!path) return socket.emit(E.ERROR, "Invalid path");
+                const stats = await this.getSftp().stat(path);
+                socket.emit(E.SFTP_FILE_STATS, stats);
+            } catch (err: any) {
+                socket.emit(E.ERROR, "Error getting stats: " + err.message);
+            }
+        });
+
+        // ── Delete directory ─────────────────────────────────────────────
+        socket.on(E.SFTP_DELETE_DIR, async (payload: FileOperationPayload): Promise<any> => {
+            try {
+                const { path } = payload;
+                if (!path) return socket.emit(E.ERROR, "Invalid path");
+                await this.getSftp().rmdir(path);
+                socket.emit(E.SUCCESS, "Deleted successfully");
+            } catch (err: any) {
+                socket.emit(E.ERROR, "Error deleting directory: " + err.message);
+            }
+        });
+
+        // ── Delete file ──────────────────────────────────────────────────
+        socket.on(E.SFTP_DELETE_FILE, async (payload: FileOperationPayload): Promise<any> => {
+            try {
+                const { path } = payload;
+                if (!path) return socket.emit(E.ERROR, "Invalid path");
+                await this.getSftp().delete(path);
+                socket.emit(E.SUCCESS, "Deleted successfully");
+            } catch (err: any) {
+                socket.emit(E.ERROR, "Error deleting file: " + err.message);
+            }
+        });
+
+        // ── ZIP extract ──────────────────────────────────────────────────
+        socket.on(E.SFTP_ZIP_EXTRACT, async (payload: FileOperationPayload): Promise<any> => {
+            try {
+                const dirPath = payload?.dirPath;
+                if (!dirPath) throw new Error("Invalid directory path");
+                const sftp = this.getSftp();
+
+                const localZipPath = join(process.cwd(), "storage", `zip-${this.sftpSessionId}`);
+                await sftp.get(dirPath, localZipPath);
+
+                const zip = new AdmZip(localZipPath);
+                const extractDir = join(localZipPath + "-extracted");
+                zip.extractAllTo(extractDir, true);
+
+                const extractedFiles = fs.readdirSync(extractDir);
+                for (const file of extractedFiles) {
+                    const localFilePath = join(extractDir, file);
+                    const remoteFilePath = posix.join(dirPath, file);
+                    const fileStat = fs.statSync(localFilePath);
+                    if (fileStat.isFile()) {
+                        await sftp.put(localFilePath, remoteFilePath);
+                    }
+                }
+
+                socket.emit(E.FILE_UPLOADED, dirPath);
+                fs.unlinkSync(localZipPath);
+                fs.rmSync(extractDir, { recursive: true, force: true });
+            } catch (err: any) {
+                socket.emit(E.ERROR, err.message);
+            }
+        });
+
+        // ── Edit file — request content ──────────────────────────────────
+        socket.on(E.SFTP_EDIT_FILE_REQUEST, async (payload: { path: string }): Promise<any> => {
+            try {
+                const { path } = payload;
+                if (!path) return socket.emit(E.ERROR, "Invalid path");
+                const data = await this.getSftp().get(path);
+                socket.emit(E.SFTP_EDIT_FILE_REQUEST_RESPONSE, data.toString());
+            } catch (err: any) {
+                socket.emit(E.ERROR, err.message || "Error reading file");
+            }
+        });
+
+        // ── Edit file — save content ─────────────────────────────────────
+        socket.on(E.SFTP_EDIT_FILE_DONE, async (payload: EditFilePayload): Promise<any> => {
+            try {
+                const { path, content } = payload;
+                await this.getSftp().put(Buffer.from(content), path);
+                socket.emit(E.SUCCESS, "File edited successfully");
+            } catch (err: any) {
+                socket.emit(E.ERROR, err.message || "Error saving file");
+            }
+        });
+
+        // ── Cancel upload / download ─────────────────────────────────────
+        socket.on(E.CANCEL_UPLOADING, (name: string) => this.progressCancel(name));
+        socket.on(E.CANCEL_DOWNLOADING, (name: string) => this.progressCancel(name));
+
+        // ── Socket disconnect → cleanup ──────────────────────────────────
+        socket.on("disconnect", async () => {
+            Logging.dev(`[SFTP:ns] Client disconnected: ${socket.id}`);
+            await Sftp_Service.disconnect(this.sftpSessionId);
+        });
+    }
+
+    private progressCancel(name: string) {
+        // Re-use the global abort controller map from the SFTP controller
+        try {
+            const { ABORT_CONTROLLER_MAP } = require("@/handlers/controllers/sftp.controller");
+            const controller = ABORT_CONTROLLER_MAP.get(name);
+            if (controller) {
+                controller.abort("Cancelled by user");
+                ABORT_CONTROLLER_MAP.delete(name);
+            }
+        } catch { }
+    }
+}

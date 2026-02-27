@@ -1,52 +1,88 @@
 import SFTPClient from 'ssh2-sftp-client';
 import { Logging } from '@enjoys/express-utils/logger';
 import { SocketEventConstants } from '../socket/events';
-const sftp = new SFTPClient();
 
+/**
+ * Multi-session SFTP manager.
+ *
+ * Each session gets its OWN `SFTPClient` instance, so multiple SFTP panels
+ * (same host or different hosts) can run concurrently.
+ *
+ * Sessions are keyed by `sftpSessionId` — typically the socket.id from the
+ * `/sftp` namespace so every socket connection is independent.
+ */
 class SFTP_Service {
-    is_connected = false
+    /** Map of sftpSessionId → SFTPClient */
     sessions = new Map<string, SFTPClient>();
 
-    constructor() {
-        // Reset is_connected when the SFTP connection drops
-
+    /** Check whether a particular session is connected */
+    isConnected(sftpSessionId: string): boolean {
+        return this.sessions.has(sftpSessionId);
     }
-    emitSftpEvent = (socket: any) => {
-        sftp.on('end', () => {
-            this.is_connected = false;
-            Logging.dev('SFTP connection ended', 'notice');
+
+    /** Bind lifecycle events on a session's client so the socket is notified */
+    emitSftpEvent(sftpSessionId: string, socket: any) {
+        const client = this.sessions.get(sftpSessionId);
+        if (!client) return;
+
+        client.on('end', () => {
+            Logging.dev(`SFTP connection ended [${sftpSessionId}]`, 'notice');
             socket.emit(SocketEventConstants.SFTP_ENDED, 'SFTP connection ended');
+            this.sessions.delete(sftpSessionId);
         });
-        sftp.on('close', () => {
-            this.is_connected = false;
-            Logging.dev('SFTP connection closed', 'notice');
-            socket.emit(SocketEventConstants.SFTP_EMIT_ERROR, 'SFTP connection ended');
-
+        client.on('close', () => {
+            Logging.dev(`SFTP connection closed [${sftpSessionId}]`, 'notice');
+            socket.emit(SocketEventConstants.SFTP_EMIT_ERROR, 'SFTP connection closed');
+            this.sessions.delete(sftpSessionId);
         });
-        sftp.on('error', (err) => {
-            this.is_connected = false;
-            Logging.dev('SFTP error: ' + err.message, 'error');
-            socket.emit(SocketEventConstants.SFTP_EMIT_ERROR, 'SFTP connection ended');
-
+        client.on('error', (err) => {
+            Logging.dev(`SFTP error [${sftpSessionId}]: ${err.message}`, 'error');
+            socket.emit(SocketEventConstants.SFTP_EMIT_ERROR, 'SFTP error: ' + err.message);
+            this.sessions.delete(sftpSessionId);
         });
     }
-    connectSFTP = async (options: SFTPClient.ConnectOptions, sessionId: string): Promise<void> => {
-        try {
-            // If there's a stale connection, end it first
-            if (this.is_connected) {
-                await sftp.end().catch(() => { });
-                this.is_connected = false;
-            }
-            await sftp.connect(options);
-            this.is_connected = true;
-            this.sessions.set(sessionId, sftp);
-            Logging.dev('Connected to SFTP server');
-        } catch (err) {
-            this.is_connected = false;
-            Logging.dev('SFTP Connection Error:' + err, 'error');
-        }
-    };
-    getSftpInstance = (): SFTPClient => sftp;
 
+    /** Create a new SFTP connection and store it under `sftpSessionId` */
+    async connectSFTP(
+        options: SFTPClient.ConnectOptions,
+        sftpSessionId: string,
+    ): Promise<SFTPClient> {
+        // Dispose a stale session if one exists with this id
+        await this.disconnect(sftpSessionId);
+
+        const client = new SFTPClient();
+        try {
+            await client.connect(options);
+            this.sessions.set(sftpSessionId, client);
+            Logging.dev(`SFTP connected [${sftpSessionId}]`);
+            return client;
+        } catch (err: any) {
+            Logging.dev(`SFTP Connection Error [${sftpSessionId}]: ${err.message}`, 'error');
+            throw err;
+        }
+    }
+
+    /** Get the SFTPClient for a specific session (or undefined) */
+    getSession(sftpSessionId: string): SFTPClient | undefined {
+        return this.sessions.get(sftpSessionId);
+    }
+
+    /** Disconnect & remove a single session */
+    async disconnect(sftpSessionId: string): Promise<void> {
+        const client = this.sessions.get(sftpSessionId);
+        if (client) {
+            await client.end().catch(() => { });
+            this.sessions.delete(sftpSessionId);
+            Logging.dev(`SFTP disconnected [${sftpSessionId}]`);
+        }
+    }
+
+    /** Disconnect all sessions (graceful shutdown) */
+    async disconnectAll(): Promise<void> {
+        for (const [id] of this.sessions) {
+            await this.disconnect(id);
+        }
+    }
 }
-export const Sftp_Service = new SFTP_Service()
+
+export const Sftp_Service = new SFTP_Service();
