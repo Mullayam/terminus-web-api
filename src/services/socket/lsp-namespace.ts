@@ -43,7 +43,16 @@ export class LSPNamespace {
     this.languageId = (query.languageId as string) ?? "";
     this.rootUri = (query.rootUri as string) ?? null;
 
-    this.init();
+    this.init().catch((err) => {
+      Logging.dev(
+        `[LSP] Unhandled error in init for "${this.languageId}": ${err?.message ?? err}`,
+        "error",
+      );
+      this.socket.emit(E.LSP_ERROR, {
+        message: `LSP init failed: ${err?.message ?? "Unknown error"}`,
+      });
+      this.socket.disconnect(true);
+    });
   }
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -80,6 +89,11 @@ export class LSPNamespace {
       );
       this.socket.emit(E.LSP_ERROR, {
         message: `Cannot start LSP server for "${this.languageId}": ${err.message}`,
+      });
+      this.socket.emit(E.EDITOR_NOTIFICATION, {
+        type: "error",
+        title: "LSP Server Error",
+        message: `Failed to start LSP for "${this.languageId}": ${err.message}`,
       });
       this.socket.disconnect(true);
       return;

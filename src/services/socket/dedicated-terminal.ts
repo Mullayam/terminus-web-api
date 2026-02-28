@@ -11,12 +11,15 @@ export interface TerminalEvents {
     data?: string;
     /** Terminal resize → backend (default `@@SSH_EMIT_RESIZE`) */
     resize?: string;
+    /** Emitted when SSH connection is ready and shell is spawned (default `@@SSH_READY`) */
+    ready?: string;
 }
 
 const DEFAULT_EVENTS: Required<TerminalEvents> = {
     input: "@@SSH_EMIT_INPUT",
     data: "@@SSH_EMIT_DATA",
     resize: "@@SSH_EMIT_RESIZE",
+    ready: "@@SSH_READY",
 };
 
 export class DedicatedTerminal {
@@ -83,7 +86,8 @@ export class DedicatedTerminal {
                     // cd into cwd from query before handing control to the user
                     const cwd = this.socket.handshake.query.cwd as string | undefined;
                     if (cwd) {
-                        stream.write(`cd ${cwd}\n`);
+                        stream.write(`cd ${cwd} && clear\n`);
+                        this.socket.emit(this.events.ready, true);
                     }
 
                     // SSH stdout → socket

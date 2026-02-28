@@ -27,6 +27,31 @@ export interface AiRequestOptions {
    * switches to the next one on any error.
    */
   provider?: AiProvider;
+  /**
+   * Override the default model for the chosen provider.
+   * When not set, the service uses its built-in default per provider.
+   */
+  model?: string;
+}
+
+export interface ChatModel {
+  id: string;
+  name: string;
+  /** Max context tokens */
+  maxTokens?: number;
+}
+
+export interface ChatProvider {
+  /** Unique provider ID (e.g. "groq", "mistral", "gemini") */
+  id: string;
+  /** Human-readable name */
+  name: string;
+  /** Optional icon URL or icon key */
+  icon?: string;
+  /** Available models for this provider */
+  models: ChatModel[];
+  /** Whether this provider is currently available / healthy */
+  available: boolean;
 }
 
 export interface AiResponse {
@@ -52,7 +77,7 @@ export interface AiResponse {
  *   When `options.provider` is NOT set, the service tries providers in order:
  *     1. Gemini  → `gemini-2.0-flash`
  *     2. Mistral → `mistral-large-latest`
- *     3. Groq    → `llama3-70b-8192`
+ *     3. Groq    → `llama-3.3-70b-versatile`
  *   On ANY error from a provider it immediately switches to the next one,
  *   carrying the full conversation context with it. The `fallbackChain`
  *   field in the response documents which switches happened and why.
@@ -69,7 +94,7 @@ export class AiService {
 
   private readonly GEMINI_MODEL = "gemini-2.0-flash";
   private readonly MISTRAL_MODEL = "mistral-large-latest";
-  private readonly GROQ_MODEL = "llama3-70b-8192";
+  private readonly GROQ_MODEL = "llama-3.3-70b-versatile";
 
   /** Default provider order */
   private readonly SEQUENCE: AiProvider[] = ["groq", "mistral", "gemini"];
@@ -146,19 +171,35 @@ export class AiService {
 
     for (const provider of providers) {
       try {
-        if (provider === "gemini")
-          return yield* this._streamGemini(options, fallbackChain);
-        if (provider === "groq")
-          return yield* this._streamGroq(options, fallbackChain);
-        // Mistral: no streaming SDK method – emit full response as single chunk
-        const result = await this._callMistral(options);
-        result.fallbackChain = fallbackChain.length ? fallbackChain : undefined;
-        yield result.text;
-        return result;
+        Logging.dev(`[AI:stream] Trying provider: ${provider}`);
+
+        let innerGen: AsyncGenerator<string, AiResponse, unknown>;
+
+        if (provider === "gemini") {
+          innerGen = this._streamGemini(options, fallbackChain);
+        } else if (provider === "groq") {
+          innerGen = this._streamGroq(options, fallbackChain);
+        } else {
+          innerGen = this._streamMistral(options, fallbackChain);
+        }
+
+        // Manually iterate so errors are reliably caught in this try/catch
+        let result: IteratorResult<string, AiResponse>;
+        while (true) {
+          result = await innerGen.next();
+          if (result.done) {
+            const finalResponse = result.value as AiResponse;
+            finalResponse.fallbackChain = fallbackChain.length
+              ? fallbackChain
+              : undefined;
+            return finalResponse;
+          }
+          yield result.value;
+        }
       } catch (err: any) {
         const msg = err?.message ?? String(err);
         Logging.dev(
-          `[AI:stream] ${provider} failed (${msg}), switching context…`,
+          `[AI:stream] ${provider} failed (${msg}), switching to next provider…`,
           "notice",
         );
         fallbackChain.push({ provider, error: msg });
@@ -172,6 +213,39 @@ export class AiService {
   /** Returns which providers are currently configured */
   availableProviders(): AiProvider[] {
     return this.SEQUENCE.filter((p) => this._isAvailable(p));
+  }
+
+  /** Returns detailed provider info including models and availability */
+  getProviderDetails(): ChatProvider[] {
+    return [
+      {
+        id: "groq",
+        name: "Groq",
+        icon: "groq",
+        available: !!this.groq,
+        models: [
+          { id: this.GROQ_MODEL, name: "Llama 3.3 70B", maxTokens: 32768 },
+        ],
+      },
+      {
+        id: "mistral",
+        name: "Mistral AI",
+        icon: "mistral",
+        available: !!this.mistral,
+        models: [
+          { id: this.MISTRAL_MODEL, name: "Mistral Large", maxTokens: 32768 },
+        ],
+      },
+      {
+        id: "gemini",
+        name: "Google Gemini",
+        icon: "gemini",
+        available: !!this.gemini,
+        models: [
+          { id: this.GEMINI_MODEL, name: "Gemini 2.0 Flash", maxTokens: 8192 },
+        ],
+      },
+    ];
   }
 
   // ── Internal: sequential fallback with context ────────────────────────────
@@ -254,8 +328,9 @@ export class AiService {
       temperature = 0.7,
     } = opts;
 
+    const modelId = opts.model ?? this.GEMINI_MODEL;
     const model: GenerativeModel = this.gemini.getGenerativeModel({
-      model: this.GEMINI_MODEL,
+      model: modelId,
       systemInstruction: system,
       generationConfig: { maxOutputTokens: maxTokens, temperature },
     });
@@ -272,7 +347,7 @@ export class AiService {
     return {
       text: resp.text(),
       provider: "gemini",
-      model: this.GEMINI_MODEL,
+      model: modelId,
       usage: {
         promptTokens: resp.usageMetadata?.promptTokenCount,
         completionTokens: resp.usageMetadata?.candidatesTokenCount,
@@ -294,8 +369,9 @@ export class AiService {
       temperature = 0.7,
     } = opts;
 
+    const modelId = opts.model ?? this.GEMINI_MODEL;
     const model = this.gemini.getGenerativeModel({
-      model: this.GEMINI_MODEL,
+      model: modelId,
       systemInstruction: system,
       generationConfig: { maxOutputTokens: maxTokens, temperature },
     });
@@ -319,13 +395,62 @@ export class AiService {
     return {
       text: fullText,
       provider: "gemini",
-      model: this.GEMINI_MODEL,
+      model: modelId,
       fallbackChain: fallbackChain.length ? fallbackChain : undefined,
       usage: { totalTokens: finalResp.usageMetadata?.totalTokenCount },
     };
   }
 
   // ── Mistral ───────────────────────────────────────────────────────────────
+
+  private async *_streamMistral(
+    opts: AiRequestOptions,
+    fallbackChain: AiResponse["fallbackChain"] = [],
+  ): AsyncGenerator<string, AiResponse, unknown> {
+    if (!this.mistral) throw new Error("Mistral client not initialised.");
+    const {
+      prompt,
+      system,
+      history = [],
+      maxTokens = 2048,
+      temperature = 0.7,
+    } = opts;
+
+    type Msg = { role: "system" | "user" | "assistant"; content: string };
+    const messages: Msg[] = [];
+    if (system) messages.push({ role: "system", content: system });
+    for (const m of history)
+      messages.push({
+        role: m.role as "user" | "assistant",
+        content: m.content,
+      });
+    messages.push({ role: "user", content: prompt });
+
+    const modelId = opts.model ?? this.MISTRAL_MODEL;
+    const stream = await this.mistral.chat.stream({
+      model: modelId,
+      messages,
+      maxTokens,
+      temperature,
+    });
+
+    let fullText = "";
+    for await (const event of stream) {
+      const raw = event.data?.choices?.[0]?.delta?.content ?? "";
+      const delta = typeof raw === "string" ? raw : (raw as any[]).map((c: any) => c.text ?? "").join("");
+      if (delta) {
+        fullText += delta;
+        yield delta;
+      }
+    }
+
+    return {
+      text: fullText,
+      provider: "mistral",
+      model: modelId,
+      fallbackChain: fallbackChain.length ? fallbackChain : undefined,
+    };
+  }
 
   private async _callMistral(opts: AiRequestOptions): Promise<AiResponse> {
     if (!this.mistral) throw new Error("Mistral client not initialised.");
@@ -347,8 +472,9 @@ export class AiService {
       });
     messages.push({ role: "user", content: prompt });
 
+    const modelId = opts.model ?? this.MISTRAL_MODEL;
     const response = await this.mistral.chat.complete({
-      model: this.MISTRAL_MODEL,
+      model: modelId,
       messages,
       maxTokens,
       temperature,
@@ -364,7 +490,7 @@ export class AiService {
     return {
       text,
       provider: "mistral",
-      model: this.MISTRAL_MODEL,
+      model: modelId,
       usage: {
         promptTokens: response.usage?.promptTokens,
         completionTokens: response.usage?.completionTokens,
@@ -395,8 +521,9 @@ export class AiService {
       });
     messages.push({ role: "user", content: prompt });
 
+    const modelId = opts.model ?? this.GROQ_MODEL;
     const completion = await this.groq.chat.completions.create({
-      model: this.GROQ_MODEL,
+      model: modelId,
       messages,
       max_tokens: maxTokens,
       temperature,
@@ -406,7 +533,7 @@ export class AiService {
     return {
       text: choice.message.content ?? "",
       provider: "groq",
-      model: this.GROQ_MODEL,
+      model: modelId,
       usage: {
         promptTokens: completion.usage?.prompt_tokens,
         completionTokens: completion.usage?.completion_tokens,
@@ -438,8 +565,9 @@ export class AiService {
       });
     messages.push({ role: "user", content: prompt });
 
+    const modelId = opts.model ?? this.GROQ_MODEL;
     const streamResp = await this.groq.chat.completions.create({
-      model: this.GROQ_MODEL,
+      model: modelId,
       messages,
       max_tokens: maxTokens,
       temperature,
@@ -456,7 +584,7 @@ export class AiService {
     return {
       text: fullText,
       provider: "groq",
-      model: this.GROQ_MODEL,
+      model: modelId,
       fallbackChain: fallbackChain.length ? fallbackChain : undefined,
     };
   }

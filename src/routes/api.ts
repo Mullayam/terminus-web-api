@@ -29,7 +29,8 @@ router.post("/file/write", SFTP.default.handleFileWrite);
 
 // AI
 router.get("/ai/providers", AiController.default.providers);
-router.post("/ai/generate", AiController.default.generate);
-router.post("/ai/stream", AiController.default.stream);
+router.post("/complete", AiController.default.generate);
+router.post("/stream", AiController.default.stream);
+router.post("/chat", AiController.default.chat);
 
 export default router;

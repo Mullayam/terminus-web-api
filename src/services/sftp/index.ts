@@ -8,8 +8,8 @@ import { SocketEventConstants } from '../socket/events';
  * Each session gets its OWN `SFTPClient` instance, so multiple SFTP panels
  * (same host or different hosts) can run concurrently.
  *
- * Sessions are keyed by `sftpSessionId` — typically the socket.id from the
- * `/sftp` namespace so every socket connection is independent.
+ * Sessions are keyed by `sftpSessionId` — a client-generated UUID sent via
+ * the `/sftp` namespace handshake query, so every SFTP panel is independent.
  */
 class SFTP_Service {
     /** Map of sftpSessionId → SFTPClient */
@@ -54,7 +54,7 @@ class SFTP_Service {
         try {
             await client.connect(options);
             this.sessions.set(sftpSessionId, client);
-            Logging.dev(`SFTP connected [${sftpSessionId}]`);
+            Logging.dev(`[SFTP:ns] Client connected: ${sftpSessionId}`);
             return client;
         } catch (err: any) {
             Logging.dev(`SFTP Connection Error [${sftpSessionId}]: ${err.message}`, 'error');
@@ -63,7 +63,7 @@ class SFTP_Service {
     }
 
     /** Get the SFTPClient for a specific session (or undefined) */
-    getSession(sftpSessionId: string): SFTPClient | undefined {
+    getSession(sftpSessionId: string): SFTPClient | undefined { 
         return this.sessions.get(sftpSessionId);
     }
 

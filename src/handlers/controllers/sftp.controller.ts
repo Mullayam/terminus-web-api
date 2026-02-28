@@ -1,5 +1,4 @@
 import { basename, join } from "path";
-import path from "path";
 import type { Response, Request } from "express";
 import { UploadedFile as ExpressUploadedFile } from "express-fileupload";
 import { Sftp_Service } from "@services/sftp";

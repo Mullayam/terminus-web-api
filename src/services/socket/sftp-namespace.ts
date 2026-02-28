@@ -2,7 +2,7 @@ import SFTPClient from "ssh2-sftp-client";
 import { Socket } from "socket.io";
 import { RedisClientType } from "redis";
 import fs from "fs";
-import { join, posix, basename } from "path";
+import { join, posix } from "path";
 import AdmZip from "adm-zip";
 import { Logging } from "@enjoys/express-utils/logger";
 import { SocketEventConstants } from "./events";
@@ -20,9 +20,8 @@ const E = SocketEventConstants;
  * hosts simultaneously.
  *
  * Handshake query params:
- *   sessionId : the main terminal/SSH session id (used to look up saved creds in Redis)
- *
- * The per-socket SFTP session is identified by `socket.id` internally.
+ *   sessionId      : the main terminal/SSH session id (used to look up saved creds in Redis)
+ *   sftpSessionId  : a client-generated UUID that uniquely identifies this SFTP panel
  *
  * ─── Client → Server ──────────────────────────────────────────────────────
  *   @@SFTP_CONNECT              { host, port?, username, authMethod, password?, privateKeyText? }
@@ -54,8 +53,12 @@ const E = SocketEventConstants;
  *   @@ERROR                     string
  */
 export class SFTPNamespace {
+    /** Grace period (ms) before tearing down SFTP after socket disconnect */
+    private static readonly DISCONNECT_GRACE_MS = 30_000;
+    /** Pending teardown timers keyed by sessionId */
+    private static pendingDisconnects = new Map<string, ReturnType<typeof setTimeout>>();
+
     private sftp!: SFTPClient;
-    private sftpSessionId: string;
     private sessionId: string;
     private currentPath = "/";
 
@@ -63,9 +66,29 @@ export class SFTPNamespace {
         private readonly socket: Socket,
         private readonly redisClient: RedisClientType,
     ) {
-        this.sftpSessionId = socket.id; // each socket = independent sftp session
-        this.sessionId = (socket.handshake.query.sessionId as string) ?? socket.id;
-        Logging.dev(`[SFTP:ns] Client connected: ${socket.id}  session=${this.sessionId}`);
+        this.sessionId = (socket.handshake.query.sessionId as string) ?? "";
+
+        if (!this.sessionId) {
+            Logging.dev(`[SFTP:ns] WARNING: no sessionId in handshake for ${socket.id}`);
+            this.registerEvents();
+            return;
+        }
+
+        // Cancel any pending teardown for this session (reconnect scenario)
+        const pending = SFTPNamespace.pendingDisconnects.get(this.sessionId);
+        if (pending) {
+            clearTimeout(pending);
+            SFTPNamespace.pendingDisconnects.delete(this.sessionId);
+            Logging.dev(`[SFTP:ns] Reconnect — cancelled pending teardown for ${this.sessionId}`);
+        }
+
+        // Reuse an existing SFTPClient that survived the grace period
+        const existing = Sftp_Service.getSession(this.sessionId);
+        if (existing) {
+            this.sftp = existing;
+            Logging.dev(`[SFTP:ns] Reusing existing SFTP connection for ${this.sessionId}`);
+        }
+
         this.registerEvents();
     }
 
@@ -84,9 +107,14 @@ export class SFTPNamespace {
         // ── Connect ──────────────────────────────────────────────────────
         socket.on(E.SFTP_CONNECT, async (data: any) => {
             try {
+                // Normalize: client may send a JSON string instead of an object
+                if (typeof data === "string") {
+                    try { data = JSON.parse(data); } catch { /* leave as-is */ }
+                }
+
                 let config: any;
 
-                if (data && data.host) {
+                if (data && typeof data === "object" && data.host) {
                     // Explicit credentials from client
                     config = parseSSHConfig(data);
                 } else {
@@ -96,14 +124,14 @@ export class SFTPNamespace {
                         socket.emit(E.SFTP_EMIT_ERROR, "No stored credentials and no credentials provided");
                         return;
                     }
-                    config = parseSSHConfig(typeof raw === "string" ? JSON.parse(raw) : raw);
+                    config = parseSSHConfig(raw);
                 }
 
-                const client = await Sftp_Service.connectSFTP(config, this.sftpSessionId);
+                const client = await Sftp_Service.connectSFTP(config, this.sessionId);
                 this.sftp = client;
 
                 // Bind lifecycle events for this session
-                Sftp_Service.emitSftpEvent(this.sftpSessionId, socket);
+                Sftp_Service.emitSftpEvent(this.sessionId, socket);
 
                 socket.emit(E.SFTP_READY, true);
 
@@ -278,37 +306,7 @@ export class SFTPNamespace {
             }
         });
 
-        // ── ZIP extract ──────────────────────────────────────────────────
-        socket.on(E.SFTP_ZIP_EXTRACT, async (payload: FileOperationPayload): Promise<any> => {
-            try {
-                const dirPath = payload?.dirPath;
-                if (!dirPath) throw new Error("Invalid directory path");
-                const sftp = this.getSftp();
-
-                const localZipPath = join(process.cwd(), "storage", `zip-${this.sftpSessionId}`);
-                await sftp.get(dirPath, localZipPath);
-
-                const zip = new AdmZip(localZipPath);
-                const extractDir = join(localZipPath + "-extracted");
-                zip.extractAllTo(extractDir, true);
-
-                const extractedFiles = fs.readdirSync(extractDir);
-                for (const file of extractedFiles) {
-                    const localFilePath = join(extractDir, file);
-                    const remoteFilePath = posix.join(dirPath, file);
-                    const fileStat = fs.statSync(localFilePath);
-                    if (fileStat.isFile()) {
-                        await sftp.put(localFilePath, remoteFilePath);
-                    }
-                }
-
-                socket.emit(E.FILE_UPLOADED, dirPath);
-                fs.unlinkSync(localZipPath);
-                fs.rmSync(extractDir, { recursive: true, force: true });
-            } catch (err: any) {
-                socket.emit(E.ERROR, err.message);
-            }
-        });
+      
 
         // ── Edit file — request content ──────────────────────────────────
         socket.on(E.SFTP_EDIT_FILE_REQUEST, async (payload: { path: string }): Promise<any> => {
@@ -337,10 +335,25 @@ export class SFTPNamespace {
         socket.on(E.CANCEL_UPLOADING, (name: string) => this.progressCancel(name));
         socket.on(E.CANCEL_DOWNLOADING, (name: string) => this.progressCancel(name));
 
-        // ── Socket disconnect → cleanup ──────────────────────────────────
-        socket.on("disconnect", async () => {
+        // ── Socket disconnect → deferred cleanup ────────────────────────
+        socket.on("disconnect", () => {
             Logging.dev(`[SFTP:ns] Client disconnected: ${socket.id}`);
-            await Sftp_Service.disconnect(this.sftpSessionId);
+
+            if (!this.sessionId) {
+                return; // no session to clean up
+            }
+
+            Logging.dev(`[SFTP:ns] Starting ${SFTPNamespace.DISCONNECT_GRACE_MS}ms grace for ${this.sessionId}`);
+
+            const timer = setTimeout(async () => {
+                SFTPNamespace.pendingDisconnects.delete(this.sessionId);
+                await Sftp_Service.disconnect(this.sessionId);
+                Logging.dev(`[SFTP:ns] Grace expired — SFTP torn down for ${this.sessionId}`);
+            }, SFTPNamespace.DISCONNECT_GRACE_MS);
+
+            // Prevent the timer from keeping the process alive
+            timer.unref?.();
+            SFTPNamespace.pendingDisconnects.set(this.sessionId, timer);
         });
     }
 
