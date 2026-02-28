@@ -2,7 +2,7 @@ import SFTPClient from "ssh2-sftp-client";
 import { Socket } from "socket.io";
 import { RedisClientType } from "redis";
 import fs from "fs";
-import { join, posix } from "path";
+import { join } from "path";
 import AdmZip from "adm-zip";
 import { Logging } from "@enjoys/express-utils/logger";
 import { SocketEventConstants } from "./events";
@@ -127,7 +127,7 @@ export class SFTPNamespace {
                     config = parseSSHConfig(raw);
                 }
 
-                const client = await Sftp_Service.connectSFTP(config, this.sessionId);
+                const client = await Sftp_Service.connectSFTP(config, this.sessionId,socket);
                 this.sftp = client;
 
                 // Bind lifecycle events for this session
@@ -330,7 +330,48 @@ export class SFTPNamespace {
                 socket.emit(E.ERROR, err.message || "Error saving file");
             }
         });
+          socket.on(SocketEventConstants.SFTP_ZIP_EXTRACT, async (payload: FileOperationPayload): Promise<any> => {
+            try {
+                let dirPath: string | undefined = payload?.dirPath
+                if (!dirPath) {
+                    throw new Error("Invalid directory path");
+                }
+                const localZipPath = join(process.cwd(), "storage");
+                await this.getSftp().get(dirPath, localZipPath);
+                // Step 2: Extract the ZIP file
+                const zip = new AdmZip(localZipPath);
+                const extractDir = join(localZipPath, 'extracted');
 
+                zip.extractAllTo(extractDir, true);
+
+                const extractedFiles = fs.readdirSync(extractDir);
+
+                for (const file of extractedFiles) {
+                    const localFilePath = join(extractDir, file);
+                    const remoteFilePath = join(dirPath, file);
+
+                    const fileStat = fs.statSync(localFilePath);
+                    if (fileStat.isFile()) {
+                        // Upload individual files
+                        await this.getSftp().put(localFilePath, remoteFilePath);
+
+                    } else if (fileStat.isDirectory()) {
+                        // Handle directories if necessary (you may want to create a recursive upload function here)
+                        // For simplicity, assume we skip directories in this example
+                        console.log(`Skipping directory: ${file}`);
+                    }
+                }
+                socket.emit(SocketEventConstants.FILE_UPLOADED, dirPath);
+
+                fs.unlinkSync(localZipPath);
+                fs.rmSync(extractDir, { recursive: true, force: true });
+
+
+            } catch (err: any) {
+                socket.emit(SocketEventConstants.ERROR, err.message);
+                console.error(err);
+            }
+        });
         // ── Cancel upload / download ─────────────────────────────────────
         socket.on(E.CANCEL_UPLOADING, (name: string) => this.progressCancel(name));
         socket.on(E.CANCEL_DOWNLOADING, (name: string) => this.progressCancel(name));
