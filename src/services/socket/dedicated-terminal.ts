@@ -2,6 +2,7 @@ import { Socket } from "socket.io";
 import { Client, ClientChannel } from "ssh2";
 import { RedisClientType } from "redis";
 import { Logging } from "@enjoys/express-utils/logger";
+import { parseSSHConfig } from "./parse-ssh-config";
 
 export interface TerminalEvents {
     /** User input → backend (default `@@SSH_EMIT_INPUT`) */
@@ -10,12 +11,15 @@ export interface TerminalEvents {
     data?: string;
     /** Terminal resize → backend (default `@@SSH_EMIT_RESIZE`) */
     resize?: string;
+    /** Emitted when SSH connection is ready and shell is spawned (default `@@SSH_READY`) */
+    ready?: string;
 }
 
 const DEFAULT_EVENTS: Required<TerminalEvents> = {
     input: "@@SSH_EMIT_INPUT",
     data: "@@SSH_EMIT_DATA",
     resize: "@@SSH_EMIT_RESIZE",
+    ready: "@@SSH_READY",
 };
 
 export class DedicatedTerminal {
@@ -50,7 +54,7 @@ export class DedicatedTerminal {
                 return;
             }
 
-            const config = this.parseSSHConfig(JSON.parse(raw));
+            const config = parseSSHConfig(JSON.parse(raw));
             this.connect(config);
         } catch (err: any) {
             Logging.dev(`DedicatedTerminal init error: ${err.message}`, "error");
@@ -58,23 +62,10 @@ export class DedicatedTerminal {
         }
     }
 
-    /** Parse raw config into ssh2 ConnectConfig */
-    private parseSSHConfig(data: any) {
-        const authOpts =
-            data.authMethod === "password"
-                ? { password: data.password }
-                : { privateKey: data.privateKeyText };
 
-        return {
-            host: data.host,
-            port: +data.port || 22,
-            username: data.username,
-            ...authOpts,
-        };
-    }
 
     /** Open SSH connection and spawn a shell */
-    private connect(config: ReturnType<typeof this.parseSSHConfig>) {
+    private connect(config: ReturnType<typeof parseSSHConfig>) {
         const ssh = new Client();
         this.ssh = ssh;
 
@@ -95,7 +86,8 @@ export class DedicatedTerminal {
                     // cd into cwd from query before handing control to the user
                     const cwd = this.socket.handshake.query.cwd as string | undefined;
                     if (cwd) {
-                        stream.write(`cd ${cwd}\n`);
+                        stream.write(`cd ${cwd} && clear\n`);
+                        this.socket.emit(this.events.ready, true);
                     }
 
                     // SSH stdout → socket

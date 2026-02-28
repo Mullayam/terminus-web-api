@@ -8,6 +8,7 @@ import { blue } from 'colorette';
 import cookieParser from 'cookie-parser';
 import { createHandlers } from '@enjoys/exception';
 import { InitSocketConnection } from './services/socket';
+import { attachLSPWebSocket } from './services/socket/lsp-websocket';
 import { RouteResolver } from '@enjoys/express-utils/routes-resolver';
 import express, { Application, NextFunction, Response, Request } from 'express'
 import fileUpload from 'express-fileupload';
@@ -90,6 +91,7 @@ class AppServer {
             console.log(blue(`Application Started Successfully on  http://localhost:${AppServer.PORT}`),)
         })
         InitSocketConnection(server)
+        attachLSPWebSocket(server, "/lsp")
 
 
         server.on('close', () => {

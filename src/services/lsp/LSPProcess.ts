@@ -18,41 +18,67 @@ export class LSPProcess {
             throw new Error("Cannot start a disposed LSP process");
         }
 
-        this.process = spawn(this.command, this.args, {
-            stdio: ["pipe", "pipe", "pipe"],
-        });
+        return new Promise<void>((resolve, reject) => {
+            this.process = spawn(this.command, this.args, {
+                stdio: ["pipe", "pipe", "pipe"],
+            });
 
-        if (!this.process.stdout || !this.process.stdin) {
-            this.process.kill();
-            throw new Error("Failed to attach stdio streams to LSP process");
-        }
+            // ── Reject immediately if the binary cannot be found ────────
+            const onSpawnError = (err: Error) => {
+                this.process = null;
+                reject(
+                    new Error(
+                        `Failed to spawn "${this.command}": ${err.message}. ` +
+                        `Is the language server installed and on PATH?`,
+                    ),
+                );
+            };
 
-        const reader = new rpc.StreamMessageReader(this.process.stdout);
-        const writer = new rpc.StreamMessageWriter(this.process.stdin);
+            this.process.on("error", onSpawnError);
 
-        this.connection = rpc.createMessageConnection(reader, writer);
+            // Once the child process has successfully spawned we can wire
+            // up the JSON-RPC connection and resolve.
+            this.process.on("spawn", () => {
+                // Remove the early-error listener; replace with the runtime one
+                this.process!.removeListener("error", onSpawnError);
 
-        this.connection.onError(([error, message, code]) => {
-            console.error(`LSP connection error [${code}]:`, error.message, message);
-        });
+                if (!this.process!.stdout || !this.process!.stdin) {
+                    this.process!.kill();
+                    this.process = null;
+                    reject(new Error("Failed to attach stdio streams to LSP process"));
+                    return;
+                }
 
-        this.connection.onClose(() => {
-            console.warn("LSP connection closed");
-        });
+                const reader = new rpc.StreamMessageReader(this.process!.stdout);
+                const writer = new rpc.StreamMessageWriter(this.process!.stdin);
 
-        this.connection.listen();
+                this.connection = rpc.createMessageConnection(reader, writer);
 
-        this.process.stderr?.on("data", (data: Buffer) => {
-            console.error(`LSP stderr: ${data.toString()}`);
-        });
+                this.connection.onError(([error, message, code]) => {
+                    console.error(`LSP connection error [${code}]:`, error.message, message);
+                });
 
-        this.process.on("error", (err) => {
-            console.error("LSP process error:", err.message);
-        });
+                this.connection.onClose(() => {
+                    console.warn("LSP connection closed");
+                });
 
-        this.process.on("exit", (code, signal) => {
-            console.warn(`LSP process exited (code=${code}, signal=${signal})`);
-            this.process = null;
+                this.connection.listen();
+
+                this.process!.stderr?.on("data", (data: Buffer) => {
+                    console.error(`LSP stderr: ${data.toString()}`);
+                });
+
+                this.process!.on("error", (err) => {
+                    console.error("LSP process runtime error:", err.message);
+                });
+
+                this.process!.on("exit", (code, signal) => {
+                    console.warn(`LSP process exited (code=${code}, signal=${signal})`);
+                    this.process = null;
+                });
+
+                resolve();
+            });
         });
     }
 

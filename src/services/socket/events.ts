@@ -1,7 +1,11 @@
 export enum SocketEventConstants {
+  /* ─── General / Lifecycle ─────────────────────────────────────────────── */
   ServerClosed = "@@ServerClosed",
   ServerError = "@@ServerError",
+  SUCCESS = "@@SUCCESS",
+  ERROR = "@@ERROR",
 
+  /* ─── Session / Terminal Sharing ──────────────────────────────────────── */
   SESSIONN_END = "@@SESSIONN_END",
   CreateTerminal = "@@Create_Terminal",
   TerminalUrl = "@@Terminal_Url",
@@ -11,10 +15,9 @@ export enum SocketEventConstants {
   session_not_found = "@@session_not_found",
   session_info = "@@session_info",
 
-
+  /* ─── SSH  (main `/` namespace) ───────────────────────────────────────── */
   SSH_START_SESSION = "@@SSH_START_SESSION",
   SSH_SESSION = "@@SSH_SESSION",
-
   SSH_RESUME = "@@SSH_RESUME",
   SSH_CONNECT = "@@SSH_CONNECT",
   SSH_READY = "@@SSH_READY",
@@ -25,14 +28,13 @@ export enum SocketEventConstants {
   SSH_EMIT_LOGS = "@@SSH_EMIT_LOGS",
   SSH_DISCONNECTED = "@@SSH_DISCONNECTED",
   CLIENT_CONNECTED = "@@CLIENT_CONNECTED",
-
   SSH_BANNER = "@@SSH_BANNER",
   SSH_TCP_CONNECTION = "@@SSH_TCP_CONNECTION",
   SSH_HOST_KEYS = "@@SSH_HOST_KEYS",
   SSH_PERMISSIONS = "@@SSH_PERMISSIONS",
 
-  // SFTP
-  SFTP_ENDED= "@@SFTP_ENDED",
+  /* ─── SFTP  (`/sftp` namespace) ───────────────────────────────────────── */
+  SFTP_ENDED = "@@SFTP_ENDED",
   SFTP_CURRENT_PATH = "@@SFTP_CURRENT_PATH",
   SFTP_CONNECT = "@@SFTP_CONNECT",
   SFTP_EMIT_ERROR = "@@SFTP_EMIT_ERROR",
@@ -57,11 +59,55 @@ export enum SocketEventConstants {
   SFTP_EDIT_FILE_REQUEST_RESPONSE = "@@SFTP_EDIT_FILE_REQUEST_RESPONSE",
   DOWNLOAD_PROGRESS = "@@DOWNLOAD_PROGRESS",
   COMPRESSING = "@@COMPRESSING",
-
   CANCEL_UPLOADING = "@@CANCEL_UPLOADING",
   CANCEL_DOWNLOADING = "@@CANCEL_DOWNLOADING",
 
-  SUCCESS = "@@SUCCESS",
-  ERROR = "@@ERROR"
+  /* ─── AI  (`/ai` namespace) ───────────────────────────────────────────── */
+  AI_GENERATE = "@@AI_GENERATE",
+  AI_STREAM = "@@AI_STREAM",
+  AI_RESULT = "@@AI_RESULT",
+  AI_CHUNK = "@@AI_CHUNK",
+  AI_DONE = "@@AI_DONE",
+  AI_ERROR = "@@AI_ERROR",
 
+  /* ─── LSP  (`/lsp` namespace) ─────────────────────────────────────────── */
+  LSP_READY = "@@LSP_READY",
+  LSP_ERROR = "@@LSP_ERROR",
+  LSP_OPEN = "@@LSP_OPEN",
+  LSP_CHANGE = "@@LSP_CHANGE",
+  LSP_CLOSE = "@@LSP_CLOSE",
+  LSP_COMPLETE = "@@LSP_COMPLETE",
+  LSP_COMPLETE_RESULT = "@@LSP_COMPLETE_RESULT",
+  LSP_HOVER = "@@LSP_HOVER",
+  LSP_HOVER_RESULT = "@@LSP_HOVER_RESULT",
+
+  /* ─── SSH file-ops  (`/ssh` namespace — reserved, not registered) ─────── */
+  SSH_NS_CONNECT = "@@SSH_NS_CONNECT",
+  SSH_NS_READY = "@@SSH_NS_READY",
+  SSH_NS_ERROR = "@@SSH_NS_ERROR",
+  SSH_NS_EXEC = "@@SSH_NS_EXEC",
+  SSH_NS_EXEC_RESULT = "@@SSH_NS_EXEC_RESULT",
+  SSH_NS_LIST_DIR = "@@SSH_NS_LIST_DIR",
+  SSH_NS_LIST_RESULT = "@@SSH_NS_LIST_RESULT",
+  SSH_NS_READ_FILE = "@@SSH_NS_READ_FILE",
+  SSH_NS_FILE_CONTENT = "@@SSH_NS_FILE_CONTENT",
+  SSH_NS_WRITE_FILE = "@@SSH_NS_WRITE_FILE",
+  SSH_NS_MKDIR = "@@SSH_NS_MKDIR",
+  SSH_NS_DELETE_FILE = "@@SSH_NS_DELETE_FILE",
+  SSH_NS_DELETE_DIR = "@@SSH_NS_DELETE_DIR",
+  SSH_NS_RENAME = "@@SSH_NS_RENAME",
+  SSH_NS_EXISTS = "@@SSH_NS_EXISTS",
+  SSH_NS_EXISTS_RESULT = "@@SSH_NS_EXISTS_RESULT",
+  SSH_NS_STAT = "@@SSH_NS_STAT",
+  SSH_NS_STAT_RESULT = "@@SSH_NS_STAT_RESULT",
+  SSH_NS_CWD = "@@SSH_NS_CWD",
+  SSH_NS_CWD_RESULT = "@@SSH_NS_CWD_RESULT",
+  SSH_NS_PUT_FILE = "@@SSH_NS_PUT_FILE",
+  SSH_NS_GET_FILE = "@@SSH_NS_GET_FILE",
+  SSH_NS_DISCONNECT = "@@SSH_NS_DISCONNECT",
+
+  /* ─── Editor Notifications  (Server → Client) ─────────────────────────── */
+  EDITOR_NOTIFICATION = "@@EDITOR_NOTIFICATION",
+  EDITOR_NOTIFICATION_UPDATE = "@@EDITOR_NOTIFICATION_UPDATE",
+  EDITOR_NOTIFICATION_DISMISS = "@@EDITOR_NOTIFICATION_DISMISS",
 }
