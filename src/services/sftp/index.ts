@@ -27,23 +27,31 @@ class SFTP_Service {
         const client = this.sessions.get(sftpSessionId);
         if (!client) return;
 
+        // Guard: only clean up if the client in the map is still THIS instance.
+        // On reconnect, connectSFTP stores a new client under the same key
+        // before the old client's async `close` event fires. Without this
+        // check the stale handler would delete the *new* client entry.
+        const guardedCleanup = () => {
+            if (this.sessions.get(sftpSessionId) === client) {
+                this.sessions.delete(sftpSessionId);
+                this.sockets.delete(sftpSessionId);
+            }
+        };
+
         client.on('end', () => {
             Logging.dev(`SFTP connection ended [${sftpSessionId}]`, 'notice');
             socket.emit(SocketEventConstants.SFTP_ENDED, 'SFTP connection ended');
-            this.sessions.delete(sftpSessionId);
-            this.sockets.delete(sftpSessionId);
+            guardedCleanup();
         });
         client.on('close', () => {
             Logging.dev(`SFTP connection closed [${sftpSessionId}]`, 'notice');
             socket.emit(SocketEventConstants.SFTP_EMIT_ERROR, 'SFTP connection closed');
-            this.sessions.delete(sftpSessionId);
-            this.sockets.delete(sftpSessionId);
+            guardedCleanup();
         });
         client.on('error', (err) => {
             Logging.dev(`SFTP error [${sftpSessionId}]: ${err.message}`, 'error');
             socket.emit(SocketEventConstants.SFTP_EMIT_ERROR, 'SFTP error: ' + err.message);
-            this.sessions.delete(sftpSessionId);
-            this.sockets.delete(sftpSessionId);
+            guardedCleanup();
         });
     }
 
@@ -83,6 +91,7 @@ class SFTP_Service {
         if (client) {
             await client.end().catch(() => { });
             this.sessions.delete(sftpSessionId);
+            this.sockets.delete(sftpSessionId);
             Logging.dev(`SFTP disconnected [${sftpSessionId}]`);
         }
     }

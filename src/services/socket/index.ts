@@ -39,7 +39,6 @@ export const InitSocketConnection = async (server: HttpServer) => {
 
   io.on("connection", (socket) => {
     listner.onConnection(socket);
-    new SFTPNamespace(socket, redisClient as any);
   });
   io.of("/dedicated-terminal").on("connection", (socket) => {
     new DedicatedTerminal(socket, redisClient as any);

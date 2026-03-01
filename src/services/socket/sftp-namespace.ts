@@ -380,8 +380,18 @@ export class SFTPNamespace {
         socket.on("disconnect", () => {
             Logging.dev(`[SFTP:ns] Client disconnected: ${socket.id}`);
 
-            if (!this.sessionId) {
-                return; // no session to clean up
+            if (!this.sessionId || !this.sftp) {
+                return; // no SFTP session was established through this socket
+            }
+
+            // Clear any existing pending timer for this session to avoid
+            // orphaned timers when multiple sockets with the same sessionId
+
+            // disconnect in quick succession (e.g. page refresh).
+            const existing = SFTPNamespace.pendingDisconnects.get(this.sessionId);
+            if (existing) {
+                clearTimeout(existing);
+                SFTPNamespace.pendingDisconnects.delete(this.sessionId);
             }
 
             Logging.dev(`[SFTP:ns] Starting ${SFTPNamespace.DISCONNECT_GRACE_MS}ms grace for ${this.sessionId}`);
