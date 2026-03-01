@@ -61,8 +61,24 @@ class SFTP_Service {
         sftpSessionId: string,
         socket: Socket
     ): Promise<SFTPClient> {
-        // Dispose a stale session if one exists with this id
-        await this.disconnect(sftpSessionId);
+        // If the existing session for this ID is still alive, reuse it.
+        // This happens when the frontend's socket reconnects (e.g. shared
+        // Manager/transport re-establishes) and re-emits SFTP_CONNECT even
+        // though the underlying SSH SFTP connection never dropped.
+        const existing = this.sessions.get(sftpSessionId);
+        if (existing) {
+            try {
+                // Quick health check — if cwd() succeeds the connection is alive
+                await existing.cwd();
+                // Update the socket reference (it changed on reconnect)
+                this.sockets.set(sftpSessionId, socket);
+                Logging.dev(`[SFTP:ns] Reusing healthy SFTP connection for ${sftpSessionId}`);
+                return existing;
+            } catch {
+                // Connection is dead — fall through to create a new one
+                await this.disconnect(sftpSessionId);
+            }
+        }
 
         const client = new SFTPClient();
         try {

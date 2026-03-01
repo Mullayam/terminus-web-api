@@ -67,17 +67,15 @@ export class SocketListener {
                 existing.connectedSockets?.delete(oldId);
                 existing.socketPermissions?.delete(oldId);
 
-                // Notify the old socket but do NOT disconnect it.
-                // Calling stale.disconnect() — even with close=false — closes the
-                // Engine.IO transport when it is the last namespace socket on that
-                // Client.  This cascades to every other namespace socket on the
-                // same browser connection (/sftp, /lsp, /ai), killing SFTP panels
-                // that should stay alive.  The old socket will clean up naturally
-                // via its heartbeat / ping timeout.
-                const stale = this.io.sockets.sockets.get(oldId);
-                if (stale) {
-                    stale.emit(E.SESSIONN_END, "Session taken over by a new connection");
-                }
+                // Do NOT disconnect or notify the old socket.
+                //
+                // Previously we called stale.disconnect() or emitted SESSIONN_END.
+                // Both cause the frontend to tear down all sockets on the shared
+                // Manager/transport — including /sftp sockets for other panels.
+                //
+                // The old socket will clean up naturally via heartbeat timeout.
+                // We've already removed it from connectedSockets/permissions above
+                // and overwritten adminSocketId below, so it's effectively inert.
                 Logging.dev(`♻️ Session ${sessionId} reconnected: ${oldId} → ${socket.id}`);
             }
 
