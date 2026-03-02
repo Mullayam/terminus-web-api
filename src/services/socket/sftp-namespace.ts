@@ -53,11 +53,6 @@ const E = SocketEventConstants;
  *   @@ERROR                     string
  */
 export class SFTPNamespace {
-    /** Grace period (ms) before tearing down SFTP after socket disconnect */
-    private static readonly DISCONNECT_GRACE_MS = 30_000;
-    /** Pending teardown timers keyed by sessionId */
-    private static pendingDisconnects = new Map<string, ReturnType<typeof setTimeout>>();
-
     private sftp!: SFTPClient;
     private sessionId: string;
     private currentPath = "/";
@@ -70,23 +65,6 @@ export class SFTPNamespace {
 
         if (!this.sessionId) {
             Logging.dev(`[SFTP:ns] WARNING: no sessionId in handshake for ${socket.id}`);
-            this.registerEvents();
-            return;
-        }
-
-        // Cancel any pending teardown for this session (reconnect scenario)
-        const pending = SFTPNamespace.pendingDisconnects.get(this.sessionId);
-        if (pending) {
-            clearTimeout(pending);
-            SFTPNamespace.pendingDisconnects.delete(this.sessionId);
-            Logging.dev(`[SFTP:ns] Reconnect — cancelled pending teardown for ${this.sessionId}`);
-        }
-
-        // Reuse an existing SFTPClient that survived the grace period
-        const existing = Sftp_Service.getSession(this.sessionId);
-        if (existing) {
-            this.sftp = existing;
-            Logging.dev(`[SFTP:ns] Reusing existing SFTP connection for ${this.sessionId}`);
         }
 
         this.registerEvents();
@@ -376,35 +354,16 @@ export class SFTPNamespace {
         socket.on(E.CANCEL_UPLOADING, (name: string) => this.progressCancel(name));
         socket.on(E.CANCEL_DOWNLOADING, (name: string) => this.progressCancel(name));
 
-        // ── Socket disconnect → deferred cleanup ────────────────────────
-        socket.on("disconnect", () => {
+        // ── Socket disconnect → immediate cleanup ───────────────────────
+        socket.on("disconnect", async () => {
             Logging.dev(`[SFTP:ns] Client disconnected: ${socket.id}`);
 
             if (!this.sessionId || !this.sftp) {
-                return; // no SFTP session was established through this socket
+                return;
             }
 
-            // Clear any existing pending timer for this session to avoid
-            // orphaned timers when multiple sockets with the same sessionId
-
-            // disconnect in quick succession (e.g. page refresh).
-            const existing = SFTPNamespace.pendingDisconnects.get(this.sessionId);
-            if (existing) {
-                clearTimeout(existing);
-                SFTPNamespace.pendingDisconnects.delete(this.sessionId);
-            }
-
-            Logging.dev(`[SFTP:ns] Starting ${SFTPNamespace.DISCONNECT_GRACE_MS}ms grace for ${this.sessionId}`);
-
-            const timer = setTimeout(async () => {
-                SFTPNamespace.pendingDisconnects.delete(this.sessionId);
-                await Sftp_Service.disconnect(this.sessionId);
-                Logging.dev(`[SFTP:ns] Grace expired — SFTP torn down for ${this.sessionId}`);
-            }, SFTPNamespace.DISCONNECT_GRACE_MS);
-
-            // Prevent the timer from keeping the process alive
-            timer.unref?.();
-            SFTPNamespace.pendingDisconnects.set(this.sessionId, timer);
+            await Sftp_Service.disconnect(this.sessionId);
+            Logging.dev(`[SFTP:ns] SFTP torn down for ${this.sessionId}`);
         });
     }
 
