@@ -137,6 +137,7 @@ export class SocketListener {
         this.registerSessionManagement(socket, sessionId);
         this.registerSSHResume(socket, sessionId);
         this.registerSSHStart(socket, sessionId);
+        this.registerSilentExec(socket, sessionId);
     }
 
     /** Session management: pause / kick / permissions */
@@ -244,6 +245,9 @@ export class SocketListener {
                             return;
                         }
                         this.bindShellEvents(socket, sessionId, stream, conn);
+
+                        // Auto-fetch history as soon as the shell is up
+                        this.execSilent(conn, socket);
                     },
                 );
             });
@@ -262,6 +266,66 @@ export class SocketListener {
 
             conn.connect(config);
             this.sessions.set(sessionId, conn);
+        });
+    }
+
+    /**
+     * Silent exec – runs a command on a **separate** exec channel so
+     * xterm never sees the output.  Used to fetch shell history, env vars,
+     * aliases, etc. and return them as deduplicated suggestion arrays.
+     *
+     * Client emits:  SSH_EXEC_SILENT  { command?: string }
+     * Server emits:  SSH_EXEC_SILENT_RESULT  string[]   (unique, trimmed)
+     *
+     * Also called automatically when the shell is first opened.
+     */
+    private registerSilentExec(socket: Socket, sessionId: string) {
+        socket.on(E.SSH_EXEC_SILENT, (payload?: { command?: string }) => {
+            const conn = this.sessions.get(sessionId);
+            if (!conn) {
+                socket.emit(E.SSH_EMIT_ERROR, "No active SSH session");
+                return;
+            }
+            this.execSilent(conn, socket, payload?.command);
+        });
+    }
+
+    /**
+     * Core silent-exec logic. Opens a one-off exec channel, collects stdout,
+     * deduplicates with a Set, and emits the result. Completely invisible to xterm.
+     */
+    private execSilent(conn: Client, socket: Socket, command?: string) {
+        const cmd =
+            command ||
+            `cat ~/.bash_history 2>/dev/null || cat ~/.zsh_history 2>/dev/null || fc -ln 1 2>/dev/null`;
+
+        conn.exec(cmd, (err, stream) => {
+            if (err) {
+                Logging.dev(`Silent exec error: ${err.message}`, "error");
+                return; // silently fail — don't spam the client on auto-calls
+            }
+
+            let stdout = "";
+
+            stream.on("data", (chunk: Buffer) => {
+                stdout += chunk.toString("utf-8");
+            });
+
+            stream.stderr.on("data", () => {
+                /* swallow stderr – not relevant for suggestions */
+            });
+
+            stream.on("close", () => {
+                // Parse, trim, deduplicate using Set
+                const lines = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+                // Strip zsh history timestamps (`: 1234567890:0;actual command`)
+                const cleaned = lines.map((l) =>
+                    l.replace(/^:\s*\d+:\d+;/, "").trim(),
+                ).filter(Boolean);
+
+                const unique = [...new Set(cleaned)];
+                socket.emit(E.SSH_EXEC_SILENT_RESULT, unique);
+            });
         });
     }
 

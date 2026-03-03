@@ -39,11 +39,13 @@ const E = SocketEventConstants;
  *   @@SFTP_ZIP_EXTRACT          { dirPath }
  *   @@SFTP_EDIT_FILE_REQUEST    { path }
  *   @@SFTP_EDIT_FILE_DONE       { path, content }
+ *   @@SFTP_GET_DIR_TREE         { dirPath?, depth? }   (default depth = 2, each expand adds +2)
  *
  * ─── Server → Client ──────────────────────────────────────────────────────
  *   @@SFTP_READY                true
  *   @@SFTP_CURRENT_PATH         string
  *   @@SFTP_FILES_LIST           { files, currentDir }
+ *   @@SFTP_DIR_TREE             { root, dirPath, depth }
  *   @@SFTP_EMIT_ERROR           string
  *   @@SFTP_ENDED                string
  *   @@SFTP_EDIT_FILE_REQUEST_RESPONSE  string
@@ -286,6 +288,20 @@ export class SFTPNamespace {
 
       
 
+        // ── Directory tree (dirs only, cascading depth) ──────────────────
+        socket.on(E.SFTP_GET_DIR_TREE, async (payload: { dirPath?: string; depth?: number }): Promise<any> => {
+            try {
+                const sftp = this.getSftp();
+                const dirPath = payload?.dirPath || this.currentPath || await sftp.cwd() as string;
+                const depth = typeof payload?.depth === "number" && payload.depth > 0 ? payload.depth : 2;
+
+                const tree = await this.buildDirTree(sftp, dirPath, depth);
+                socket.emit(E.SFTP_DIR_TREE, { root: tree, dirPath, depth });
+            } catch (err: any) {
+                socket.emit(E.ERROR, "Error fetching directory tree: " + err.message);
+            }
+        });
+
         // ── Edit file — request content ──────────────────────────────────
         socket.on(E.SFTP_EDIT_FILE_REQUEST, async (payload: { path: string }): Promise<any> => {
             try {
@@ -365,6 +381,82 @@ export class SFTPNamespace {
             await Sftp_Service.disconnect(this.sessionId);
             Logging.dev(`[SFTP:ns] SFTP torn down for ${this.sessionId}`);
         });
+    }
+
+    /**
+     * Recursively list **directories only** up to `maxDepth` levels.
+     *
+     * Returns a tree like:
+     * ```
+     * { name: "src", path: "/home/user/src", children: [ … ] }
+     * ```
+     * Leaf nodes (at max depth) have `children: null` so the client knows
+     * it can request deeper expansion via another `@@SFTP_GET_DIR_TREE`
+     * call with `depth + 2`.
+     */
+    /** Directories to skip — heavy / non-useful folders that bloat the tree */
+    private static readonly IGNORED_DIRS = new Set([
+        "node_modules",
+        ".git",
+        ".hg",
+        ".svn",
+        "__pycache__",
+        ".cache",
+        ".npm",
+        ".yarn",
+        "bower_components",
+        ".venv",
+        "venv",
+        "env",
+        ".env",
+        "dist",
+        ".next",
+        ".nuxt",
+        ".turbo",
+        ".parcel-cache",
+        ".idea",
+        ".vscode",
+        "vendor",
+        "coverage",
+        ".tox",
+        ".gradle",
+        ".cargo",
+        "target",
+    ]);
+
+    private async buildDirTree(
+        sftp: SFTPClient,
+        dirPath: string,
+        maxDepth: number,
+        currentDepth = 0,
+    ): Promise<{ name: string; path: string; children: any[] | null }> {
+        const name = dirPath.split("/").filter(Boolean).pop() || "/";
+        const node: { name: string; path: string; children: any[] | null } = {
+            name,
+            path: dirPath,
+            children: null,
+        };
+
+        if (currentDepth >= maxDepth) return node; // leaf — client can expand later
+
+        try {
+            const items = await sftp.list(dirPath);
+            const dirs = items.filter(
+                (i) => i.type === "d" && !SFTPNamespace.IGNORED_DIRS.has(i.name),
+            );
+
+            node.children = [];
+            for (const dir of dirs) {
+                const childPath = dirPath.replace(/\/$/, "") + "/" + dir.name;
+                const child = await this.buildDirTree(sftp, childPath, maxDepth, currentDepth + 1);
+                node.children.push(child);
+            }
+        } catch {
+            // Permission denied or similar — treat as unexpandable leaf
+            node.children = null;
+        }
+
+        return node;
     }
 
     private progressCancel(name: string) {
