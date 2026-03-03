@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import { aiService, type AiProvider, type AiMessage } from "../../services/ai";
 import { readFileSync } from "fs";
 import { Logging } from "@enjoys/express-utils/logger";
+import { error } from "console";
 
 // ─── Monaco Completion Item Generator — System Prompt ─────────────────────────
 const MONACO_COMPLETION_SYSTEM_PROMPT = (language: string, filename: string, range: string) => `You are a Monaco Editor completion item generator.
@@ -138,7 +139,7 @@ kind values (use the INTEGER number, NOT the string):
 CRITICAL: "kind" MUST be a plain integer (e.g. 13, 2, 14). NEVER use a string like "monaco.languages.CompletionItemKind.Keyword". Only output the raw number.
 
 GENERATION RULES:
-1. Generate the MAXIMUM possible number of completion items for the language (aim for 60–150+ items). Be EXHAUSTIVE. Cover every single one of these categories that applies to the language:
+1. Generate a list of exactly 100 completion items maximum for the language. Cover the most useful items from each of these categories that applies to the language:
    a. ALL language keywords (every reserved word: if, else, for, while, do, switch, case, break, continue, return, class, function, const, let, var, import, export, async, await, yield, try, catch, finally, throw, new, delete, typeof, instanceof, in, of, void, super, this, extends, implements, static, public, private, protected, abstract, interface, enum, type, namespace, module, declare, readonly, as, is, from, default, with, debugger, etc.)
    b. ALL built-in functions and global functions (print, len, range, map, filter, reduce, parseInt, parseFloat, isNaN, setTimeout, setInterval, fetch, require, console.log, console.error, console.warn, JSON.parse, JSON.stringify, Object.keys, Array.from, Math.floor, Math.random, etc.)
    c. ALL built-in types and classes (String, Number, Boolean, Array, Object, Map, Set, Promise, Date, RegExp, Error, Buffer, int, float, str, list, dict, tuple, set, bool, bytes, etc.)
@@ -308,65 +309,18 @@ class AiController {
       };
 
 
+      const range = body.range ?? { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 };
+
       const result = await aiService.generate({
-        prompt: "Generate Monaco Editor completion items for this language and file, based on the cursor position. Respond with a JSON array of completion items only, no explanation.",
+        prompt: "Generate Monaco Editor completion items for this language and file, based on the cursor position. Respond ONLY with a JSON object like {\"items\":[...]} containing completion items. No explanation, no markdown.",
         system: MONACO_COMPLETION_SYSTEM_PROMPT(
           body.language,
           body.filename ?? "unknown",
-          JSON.stringify(body.range
-            ? body.range
-            : "RANGE_PLACEHOLDER"
-          ),
+          JSON.stringify(range),
         ),
-        "responseFormat": "json_schema",
-        "responseSchema": {
-          "name": "monaco_completions",
-          "description": "Array of Monaco Editor CompletionItem objects",
-          "schema": {
-            "type": "object",
-            "properties": {
-              "items": {
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "label": {
-                      "type": "string",
-                      "description": "Trigger word shown in the dropdown"
-                    },
-                    "kind": {
-                      "type": "integer",
-                      "description": "Monaco CompletionItemKind: 0=Method, 1=Function, 2=Constructor, 3=Field, 4=Variable, 5=Class, 6=Struct, 7=Interface, 8=Module, 9=Property, 10=Event, 11=Operator, 12=Unit, 13=Value, 14=Constant, 15=Enum, 16=EnumMember, 17=Keyword, 18=Text, 19=Color, 20=File, 21=Reference, 23=Folder, 24=TypeParameter, 27=Snippet"
-                    },
-                    "insertText": {
-                      "type": "string",
-                      "description": "Text to insert — use $1 $2 ${1:placeholder} for snippet tabstops"
-                    },
-                    "insertTextRules": {
-                      "type": "integer",
-                      "enum": [0, 4],
-                      "description": "4 when insertText has tabstop syntax, 0 otherwise"
-                    },
-                    "documentation": {
-                      "type": "string",
-                      "description": "One-line description shown in the popup detail panel"
-                    },
-                    "detail": {
-                      "type": "string",
-                      "enum": ["keyword", "built-in", "snippet", "method", "constant", "type", "module"],
-                      "description": "Category tag"
-                    }
-                  },
-                  "required": ["label", "kind", "insertText", "insertTextRules", "documentation", "detail"],
-                  "additionalProperties": false
-                }
-              }
-            },
-            "required": ["items"],
-            "additionalProperties": false
-          },
-          "strict": true
-        }
+        maxTokens: 12000,
+        temperature: 0.3,
+        responseFormat: "json_object",
       });
 
       // Strip markdown code fences if present, then parse JSON
@@ -378,29 +332,53 @@ class AiController {
       let items: any[];
       try {
         const parsed = JSON.parse(raw);
-        // json_schema mode wraps in { items: [...] }; plain json_object may return a bare array
         items = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.items) ? parsed.items : [];
       } catch {
         // Attempt to extract a JSON array from the response
         const match = raw.match(/\[[\s\S]*\]/);
         if (match) {
-          items = JSON.parse(match[0]);
+          try { items = JSON.parse(match[0]); } catch { items = []; }
         } else {
-          res.status(502).json({ success: false, message: "AI returned invalid JSON for completions." });
-          return;
+          items = [];
         }
       }
 
+      // If we got zero items, try to salvage truncated JSON by closing the array
+      if ((!Array.isArray(items) || items.length === 0) && raw.includes("[")) {
+        try {
+          let truncated = raw.match(/\[[\s\S]*/)?.[0] ?? "";
+          // Remove trailing incomplete object (after last })
+          const lastBrace = truncated.lastIndexOf("}");
+          if (lastBrace > 0) {
+            truncated = truncated.substring(0, lastBrace + 1) + "]";
+            // Close any wrapper object if needed
+            if (raw.trimStart().startsWith("{") && !truncated.endsWith("}}")) {
+              // bare array case
+            }
+            const salvaged = JSON.parse(truncated);
+            items = Array.isArray(salvaged) ? salvaged : [];
+          }
+        } catch { /* give up salvaging */ }
+      }
+
       if (!Array.isArray(items) || items.length === 0) {
-        res.status(502).json({ success: false, message: "AI did not return a valid completions array." });
+        Logging.dev(`[AI:completions] Failed to parse response (${raw.length} chars): ${raw.substring(0, 200)}…`, "notice");
+        res.status(502).json({ items: [], error: "AI returned invalid JSON for completions." });
         return;
       }
 
-      res.status(200).json({ ["monaco_completions"]: items, error: "" });
+      Logging.dev(`[AI:completions] Got ${items.length} items from ${result.provider}/${result.model}`);
+
+      // Inject range into every item (saves tokens by not requiring AI to repeat it)
+      for (const item of items) {
+        item.range = range;
+      }
+
+      res.status(200).json({items: items ,error: "" });
     } catch (err: any) {
       res.status(500).json({
-        success: false,
-        message: err instanceof Error ? err.message : "AI generation failed.",
+        items: [],
+        error: err instanceof Error ? err.message : "AI generation failed.",
       });
     }
   }
