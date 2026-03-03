@@ -28,8 +28,9 @@ router.post("/file/read", SFTP.default.handleFileRead);
 router.post("/file/write", SFTP.default.handleFileWrite);
 
 // AI
-router.get("/ai/providers", AiController.default.providers);
+router.get("/ai/providers", AiController.default.providers); 
 router.post("/complete", AiController.default.generate);
+router.post("/completions", AiController.default.completions);
 router.post("/stream", AiController.default.stream);
 router.post("/chat", AiController.default.chat);
 

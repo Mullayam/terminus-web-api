@@ -42,6 +42,7 @@
     "@enjoys/express-utils": "^2.0.1",
     "@google/generative-ai": "^0.24.1",
     "@mistralai/mistralai": "^1.14.1",
+    "@openrouter/sdk": "^0.9.11",
     "@socket.io/redis-adapter": "^8.3.0",
     "adm-zip": "^0.5.16",
     "archiver": "^7.0.1",
