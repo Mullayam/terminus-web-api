@@ -58,6 +58,11 @@ export const InitSocketConnection = async (server: HttpServer) => {
     });
   });
 
+  // Sync SSH_PERMISSIONS into the collaborative session
+  listner.on("permission-changed", ({ sessionId, targetSocketId, permission }) => {
+    collab.syncPermission(sessionId, targetSocketId, permission);
+  });
+
   io.on("connection", (socket) => {
     listner.onConnection(socket);
     collab.registerAll(socket);

@@ -40,9 +40,7 @@ A secure, real-time terminal collaboration platform enabling shared SFTP session
   - WebSocket (Socket.io)
   - Redis for session management
 
-- **Security:**
-  - JWT authentication
-  - SSH key encryption
+- **Security:** 
   - HTTPS/WSS protocols
   - Rate limiting
 

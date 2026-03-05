@@ -214,7 +214,9 @@
 
   JOINER (non-admin):
   ─────────────────────────────────────────────────────────────────────────────
-  1.  Connect socket to "/"
+  1.  Connect socket to "/" with query:  { sessionId, role: "collab" }
+      ─ The role="collab" flag tells the server this is NOT the admin.
+        Without it, the server assumes admin and will overwrite ownership.
   2.  Emit  @@COLLAB_CHECK_ROOM  { sessionId }
   3.  Listen for @@COLLAB_ROOM_STATUS:
         - exists=false → show "Session not found", stop

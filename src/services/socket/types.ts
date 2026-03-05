@@ -15,6 +15,8 @@ export interface SessionInfo {
     connectedSockets: Set<string>;
     /** Current terminal dimensions */
     terminalSize: { width: number; height: number; cols: number; rows: number };
+    /** Pending timer for admin disconnect grace period */
+    adminReconnectTimer?: ReturnType<typeof setTimeout>;
 }
 
 /* ─── Convenience type aliases ────────────────────────────────────────────── */

@@ -21,6 +21,7 @@ import type {
 const E = SocketEventConstants;
 
 const AUTO_LOCK_TTL = 4_000; // ms
+const ADMIN_RECONNECT_GRACE = 30_000; // ms — grace period before destroying session on admin disconnect
 
 /**
  * Collaborative terminal handler.
@@ -49,6 +50,10 @@ export class CollaborativeTerminal {
     private streams = new Map<string, ClientChannel>();
     /** socketId → set of sessionIds they've joined (for disconnect cleanup) */
     private socketSessions = new Map<string, Set<string>>();
+    /** sessionId → pending destruction timer (admin disconnect grace period) */
+    private pendingDestroy = new Map<string, ReturnType<typeof setTimeout>>();
+    /** Sessions where the admin is in the process of reconnecting */
+    private reconnecting = new Set<string>();
 
     constructor(
         private readonly io: Server,
@@ -64,6 +69,12 @@ export class CollaborativeTerminal {
 
     /** Create a collaborative session. Call once when the SSH shell is ready. */
     createSession(sessionId: string, adminSocketId: string) {
+        if (this.sessionMap.has(sessionId)) {
+            // Session survived a reconnection — update the admin socket
+            this.reconnectAdmin(sessionId, adminSocketId);
+            return;
+        }
+
         this.sessionMap.set(sessionId, {
             adminSocketId,
             permissions: new Map([[adminSocketId, "777"]]),
@@ -84,8 +95,76 @@ export class CollaborativeTerminal {
         this.streams.set(sessionId, stream);
     }
 
+    /**
+     * Sync a permission change from the legacy SSH_PERMISSIONS path
+     * into the collab session so that COLLAB_INPUT respects it.
+     */
+    syncPermission(sessionId: string, targetSocketId: string, permission: SocketPermission) {
+        const session = this.sessionMap.get(sessionId);
+        if (!session) return;
+        if (targetSocketId === session.adminSocketId) return; // admin is always 777
+        if (permission === "777") return; // don't allow escalation via this path
+        session.permissions.set(targetSocketId, permission);
+    }
+
+    /**
+     * Reconnect the admin after a page refresh / socket reconnection.
+     * Cancels any pending grace-period destruction and updates internal state.
+     */
+    reconnectAdmin(sessionId: string, newSocketId: string) {
+        // Cancel pending destruction
+        this.reconnecting.delete(sessionId);
+        const timer = this.pendingDestroy.get(sessionId);
+        if (timer) {
+            clearTimeout(timer);
+            this.pendingDestroy.delete(sessionId);
+        }
+
+        const session = this.sessionMap.get(sessionId);
+        if (!session) return;
+
+        const oldAdminId = session.adminSocketId;
+
+        // Update admin identity
+        session.adminSocketId = newSocketId;
+        session.permissions.set(newSocketId, "777");
+        session.connectedSockets.add(newSocketId);
+
+        // Clean up old admin references
+        session.connectedSockets.delete(oldAdminId);
+        session.permissions.delete(oldAdminId);
+        session.socketIPs.delete(oldAdminId);
+
+        const oldSet = this.socketSessions.get(oldAdminId);
+        if (oldSet) {
+            oldSet.delete(sessionId);
+            if (oldSet.size === 0) this.socketSessions.delete(oldAdminId);
+        }
+
+        // Track new socket
+        this.trackSocket(newSocketId, sessionId);
+
+        // Join new socket to the collab room
+        const newSocket = this.io.sockets.sockets.get(newSocketId);
+        newSocket?.join(this.room(sessionId));
+
+        // Unbind old stream — caller will rebind via bindStream()
+        this.streams.delete(sessionId);
+
+        Logging.dev(`♻️ Collab admin reconnected: ${sessionId} (${oldAdminId} → ${newSocketId})`);
+    }
+
     /** Remove all state for a session (SSH ended). */
     destroySession(sessionId: string) {
+        // If admin is reconnecting (grace period active), skip destruction
+        if (this.reconnecting.has(sessionId)) return;
+
+        const pendingTimer = this.pendingDestroy.get(sessionId);
+        if (pendingTimer) {
+            clearTimeout(pendingTimer);
+            this.pendingDestroy.delete(sessionId);
+        }
+
         const lock = this.lockMap.get(sessionId);
         if (lock?.timer) clearTimeout(lock.timer);
         this.lockMap.delete(sessionId);
@@ -117,7 +196,7 @@ export class CollaborativeTerminal {
     private onCheckRoom(socket: Socket) {
         socket.on(E.COLLAB_CHECK_ROOM, (payload?: { sessionId?: string }) => {
             const sid = payload?.sessionId ?? (socket.handshake.query.sessionId as string);
-            Logging.dev(`��� CHECK_ROOM from ${socket.id} | sid=${sid}`);
+            Logging.dev(`��� CHECK_ROOM from ${socket.id} | sid=${sid}`);
 
             if (!sid) {
                 socket.emit(E.COLLAB_ROOM_STATUS, { exists: false, blocked: false, userCount: 0 });
@@ -129,7 +208,7 @@ export class CollaborativeTerminal {
             const ip = this.resolveIP(socket);
             const blocked = exists ? session.blockedIPs.has(ip) : false;
 
-            Logging.dev(`��� CHECK_ROOM → exists=${exists} blocked=${blocked} sessions=[${[...this.sessionMap.keys()].join(", ")}]`);
+            Logging.dev(`��� CHECK_ROOM → exists=${exists} blocked=${blocked} sessions=[${[...this.sessionMap.keys()].join(", ")}]`);
 
             socket.emit(E.COLLAB_ROOM_STATUS, {
                 exists,
@@ -478,11 +557,23 @@ export class CollaborativeTerminal {
                 this.removeSocket(sessionId, socket.id);
 
                 if (isAdmin) {
-                    this.io.to(this.room(sessionId)).emit(E.COLLAB_SESSION_ENDED, {
-                        reason: "admin-disconnected",
-                        message: "Session ended — the admin has disconnected.",
-                    });
-                    this.destroySession(sessionId);
+                    // Don't destroy immediately — admin may be refreshing the page.
+                    // Start a grace period; if they reconnect in time the session survives.
+                    this.reconnecting.add(sessionId);
+                    const timer = setTimeout(() => {
+                        this.reconnecting.delete(sessionId);
+                        this.pendingDestroy.delete(sessionId);
+
+                        const stillExists = this.sessionMap.get(sessionId);
+                        if (stillExists) {
+                            this.io.to(this.room(sessionId)).emit(E.COLLAB_SESSION_ENDED, {
+                                reason: "admin-disconnected",
+                                message: "Session ended — the admin has disconnected.",
+                            });
+                            this.destroySession(sessionId);
+                        }
+                    }, ADMIN_RECONNECT_GRACE);
+                    this.pendingDestroy.set(sessionId, timer);
                 } else {
                     const userCount = session.connectedSockets.size;
                     this.io.to(this.room(sessionId)).emit(E.COLLAB_USER_LEFT, {

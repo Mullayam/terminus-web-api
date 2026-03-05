@@ -9,6 +9,7 @@ import { TerminalSharingHandler } from "./terminal-sharing";
 import type { SessionInfo, SocketPermission } from "./types";
 
 const E = SocketEventConstants;
+const ADMIN_RECONNECT_GRACE = 15_000; // ms — wait before killing SSH on admin disconnect
 
 /**
  * Main `/` namespace listener.
@@ -47,9 +48,14 @@ export class SocketListener extends EventEmitter {
 
     public onConnection(socket: Socket) {
         const sessionId = socket.handshake.query.sessionId as string;
+        const role = (socket.handshake.query.role as string) ?? "admin";
 
         if (sessionId) {
-            this.handleSessionConnect(socket, sessionId);
+            if (role === "collab") {
+                this.handleCollabConnect(socket, sessionId);
+            } else {
+                this.handleSessionConnect(socket, sessionId);
+            }
         } else {
             Logging.dev(`🔌 Client connected: ${socket.id}`);
         }
@@ -59,25 +65,35 @@ export class SocketListener extends EventEmitter {
         this.registerDisconnectEvents(socket, sessionId);
     }
 
+    /** A collab participant joined — never touch adminSocketId */
+    private handleCollabConnect(socket: Socket, sessionId: string) {
+        const existing = this.sessionInfo[sessionId];
+        if (!existing) {
+            Logging.dev(`⚠️ Collab join for unknown session: ${sessionId}`);
+            return;
+        }
+
+        existing.connectedSockets?.add(socket.id);
+        socket.join(`terminal:${sessionId}`);
+        Logging.dev(`👤 Participant joined session: ${sessionId} + ${socket.id}`);
+    }
+
     /** Handle new or returning admin sessions */
     private handleSessionConnect(socket: Socket, sessionId: string) {
         const existing = this.sessionInfo[sessionId];
 
         if (existing) {
             const oldId = existing.adminSocketId;
+
             if (oldId && oldId !== socket.id) {
+                // Admin reconnection (e.g. page refresh)
+                if (existing.adminReconnectTimer) {
+                    clearTimeout(existing.adminReconnectTimer);
+                    delete existing.adminReconnectTimer;
+                }
+
                 existing.connectedSockets?.delete(oldId);
                 existing.socketPermissions?.delete(oldId);
-
-                // Do NOT disconnect or notify the old socket.
-                //
-                // Previously we called stale.disconnect() or emitted SESSIONN_END.
-                // Both cause the frontend to tear down all sockets on the shared
-                // Manager/transport — including /sftp sockets for other panels.
-                //
-                // The old socket will clean up naturally via heartbeat timeout.
-                // We've already removed it from connectedSockets/permissions above
-                // and overwritten adminSocketId below, so it's effectively inert.
                 Logging.dev(`♻️ Session ${sessionId} reconnected: ${oldId} → ${socket.id}`);
             }
 
@@ -113,19 +129,26 @@ export class SocketListener extends EventEmitter {
             Logging.dev(`Client disconnected: ${socket.id}`);
 
             for (const [sid, info] of Object.entries(this.sessionInfo)) {
-                this.redisClient.del(`sftp:${sessionId}`);
-                this.sharedTerminalSessions.delete(sid);
-
                 if (socket.id === info.adminSocketId) {
-                    // Notify all connected sockets that the session is over
-                    this.io.to(`terminal:${sid}`).emit(E.SESSIONN_END, "Session ended — the admin has disconnected.");
+                    // Grace period: admin may be refreshing — don't kill SSH immediately
+                    Logging.dev(`⏳ Admin disconnect grace period started: ${sid}`);
+                    info.adminReconnectTimer = setTimeout(() => {
+                        delete info.adminReconnectTimer;
+                        // Re-check: if adminSocketId changed, someone reconnected — abort
+                        if (info.adminSocketId !== socket.id) {
+                            Logging.dev(`♻️ Admin reconnected during grace period: ${sid}`);
+                            return;
+                        }
 
-                    this.sessions.get(sid)?.end();
-                    this.sessions.delete(sid);
-                    delete this.sessionInfo[sid];
-                    this.redisClient.del(`terminal:history:${sid}`);
-                    socket.leave(`terminal:${sid}`);
-                    Logging.dev(`Admin Disconnected: ${sid}`);
+                        this.io.to(`terminal:${sid}`).emit(E.SESSIONN_END, "Session ended — the admin has disconnected.");
+                        this.sessions.get(sid)?.end();
+                        this.sessions.delete(sid);
+                        delete this.sessionInfo[sid];
+                        this.redisClient.del(`terminal:history:${sid}`);
+                        this.redisClient.del(`sftp:${sid}`);
+                        this.sharedTerminalSessions.delete(sid);
+                        Logging.dev(`❌ Admin Disconnected (grace expired): ${sid}`);
+                    }, ADMIN_RECONNECT_GRACE);
                 } else {
                     info.socketPermissions?.delete(socket.id);
                     info.connectedSockets?.delete(socket.id);
@@ -179,12 +202,20 @@ export class SocketListener extends EventEmitter {
             const info = this.sessionInfo[data.sessionId];
             if (!info) return;
 
-            info.socketPermissions?.set(socket.id, data.permissions);
+            info.socketPermissions?.set(data.socketId, data.permissions);
             this.io.sockets.sockets.get(data.socketId)?.emit(E.SSH_PERMISSIONS, input);
 
             if (info.adminSocketId) {
                 this.io.sockets.sockets.get(info.adminSocketId)?.emit(E.SSH_PERMISSIONS, input);
             }
+
+            // Sync permission into the collaborative terminal session
+            // so that COLLAB_INPUT respects it.
+            this.emit("permission-changed", {
+                sessionId: data.sessionId,
+                targetSocketId: data.socketId,
+                permission: data.permissions,
+            });
         });
     }
 
@@ -368,6 +399,12 @@ export class SocketListener extends EventEmitter {
             stream.setWindow(size.rows, size.cols, 1280, 720);
         });
 
-        socket.on("disconnect", () => conn.end());
+        socket.on("disconnect", () => {
+            // Do NOT kill SSH here. The grace-period timer in
+            // registerDisconnectEvents handles admin disconnects.
+            // Collab users must never tear down the connection.
+            // If no grace period fires (i.e. admin truly left for good),
+            // the timer callback will call conn.end().
+        });
     }
 }
