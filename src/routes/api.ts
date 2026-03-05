@@ -34,5 +34,6 @@ router.post("/completions", AiController.default.completions);
 router.post("/hover", AiController.default.hover);
 router.post("/stream", AiController.default.stream);
 router.post("/chat", AiController.default.chat);
+router.post("/chat/ai", AiController.default.chatWithAI);
 
 export default router;

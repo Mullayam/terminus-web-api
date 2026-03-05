@@ -9,6 +9,8 @@ import { DedicatedTerminal } from "./dedicated-terminal";
 import { LSPNamespace } from "./lsp-namespace";
 import { AiNamespace } from "./ai-namespace";
 import { SFTPNamespace } from "./sftp-namespace";
+import { CollaborativeTerminal } from "./collaborative-terminal";
+ 
 
 let socketIo: Server<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, any>;
 
@@ -37,9 +39,31 @@ export const InitSocketConnection = async (server: HttpServer) => {
     io,
   );
 
+  const collabSubClient = subClient.duplicate();
+  await collabSubClient.connect();
+
+  const collab = new CollaborativeTerminal(
+    io,
+    pubClient as any,
+    collabSubClient as any,
+  );
+
+  listner.on("shell-ready", ({ sessionId, stream, socket: adminSocket }) => {
+    collab.createSession(sessionId, adminSocket.id);
+    collab.bindStream(sessionId, stream);
+
+    // Clean up collab state when the PTY stream closes
+    stream.on("close", () => {
+      collab.destroySession(sessionId);
+    });
+  });
+
   io.on("connection", (socket) => {
     listner.onConnection(socket);
+    const sessionId = socket.handshake.query.sessionId as string;
+    if (sessionId) collab.register(socket, sessionId);
   });
+ 
   io.of("/dedicated-terminal").on("connection", (socket) => {
     new DedicatedTerminal(socket, redisClient as any);
   });

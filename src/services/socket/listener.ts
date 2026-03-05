@@ -1,3 +1,4 @@
+import { EventEmitter } from "events";
 import { Server, Socket } from "socket.io";
 import { Client, ClientChannel, ParsedKey } from "ssh2";
 import { RedisClientType } from "redis";
@@ -18,7 +19,7 @@ const E = SocketEventConstants;
  *  - Session management (permissions, pause, kick)
  *  - Delegates terminal sharing to `TerminalSharingHandler`
  */
-export class SocketListener {
+export class SocketListener extends EventEmitter {
     private sessions = new Map<string, Client>();
     private sharedTerminalSessions = new Map<string, string[]>();
     private sessionInfo: Record<string, Partial<SessionInfo>> = {};
@@ -30,6 +31,7 @@ export class SocketListener {
         subClient: RedisClientType,
         private readonly io: Server,
     ) {
+        super();
         this.sharing = new TerminalSharingHandler(
             io,
             subClient,
@@ -347,6 +349,8 @@ export class SocketListener {
         });
 
         stream.on("close", () => conn.end());
+
+        this.emit("shell-ready", { sessionId, stream, socket });
 
         socket.on(E.SSH_EMIT_INPUT, (input: string) => stream.write(input));
 

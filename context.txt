@@ -1,0 +1,473 @@
+================================================================================
+COLLABORATIVE TERMINAL SHARING — COMPLETE NOTES
+xterm.js · Socket.IO · Redis · Node.js PTY
+================================================================================
+
+
+================================================================================
+PART 1 — PROBLEM STATEMENT
+================================================================================
+
+THE STARTING POINT
+------------------
+Two Socket.IO events wired to a Node PTY stream:
+
+  // OUTPUT
+  stream.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf-8");
+      socket.emit("@@SSH_EMIT_DATA", text);
+      this.pubClient.publish(`terminal:${sessionId}`, text);
+  });
+
+  // INPUT
+  socket.on("@@SSH_EMIT_INPUT", (input: string) => stream.write(input));
+
+Works fine for one user. Breaks the moment a second user connects.
+
+
+CORE PROBLEM — PTY IS A SINGLE BYTE STREAM
+-------------------------------------------
+A PTY has no concept of users. It is a raw byte stream.
+Writing from two sources simultaneously does not queue — it interleaves.
+
+  User A types:  "git "     → 4 bytes arrive at PTY
+  User B types:  "ls"       → 2 bytes arrive at PTY (interleaved)
+  PTY receives:  "glit s"   → garbage, neither command runs
+
+
+ALL FAILURE CASES
+-----------------
+  Case                   | What happens
+  -----------------------|------------------------------------------
+  Simultaneous typing    | Interleaved bytes → garbled command       CRITICAL
+  Concurrent Enter       | Two commands sent, output mixed           CRITICAL
+  Observer writes        | Read-only viewer input reaches PTY        CRITICAL
+  Rapid succession       | B's input appended to A's command        HIGH
+  Tab completion clash   | PTY completion state corrupted            HIGH
+  Ctrl+C collision       | B kills A's running process               HIGH
+  Disconnect mid-type    | Partial command stuck in PTY buffer       MEDIUM
+  Reconnect replay       | Command duplicated in PTY buffer          MEDIUM
+
+
+================================================================================
+PART 2 — ATTEMPT 1: REDIS GET ON EVERY KEYSTROKE
+================================================================================
+
+THE IDEA
+--------
+Before every PTY write, GET from Redis to check if someone else owns the session.
+
+  socket.on("@@SSH_EMIT_INPUT", async (input: string) => {
+      const lockOwner = await this.pubClient.get(`terminal:${sessionId}:lock`);
+      if (lockOwner && lockOwner !== socket.id) {
+          socket.emit("@@SSH_PTY_LOCKED", { lockedBy: lockOwner });
+          return;
+      }
+      stream.write(input);
+      await this.pubClient.set(`terminal:${sessionId}:lock`, socket.id, "EX", 5);
+  });
+
+
+LATENCY PER KEYSTROKE
+---------------------
+  Without Redis check (baseline)   ~4ms
+  Redis GET same datacenter        +3ms
+  Redis GET cross-region           +18ms
+  Redis GET high load / cold       +35ms
+
+At 10 keys/second under load = 350ms/sec of blocking async overhead.
+
+
+WHY IT FAILS
+------------
+  1. Redis GET is async — stream.write() can still fire before GET resolves (race window)
+  2. Latency added on EVERY keystroke, even for the owner who already holds the lock
+  3. Two clients can both GET "null" simultaneously and both write (TOCTOU race)
+  4. await before stream.write() means PTY write is blocked by network I/O
+  5. Under Redis pressure, keystrokes queue up and feel sticky or drop
+
+
+================================================================================
+PART 3 — ATTEMPT 2: BUFFER UNTIL ENTER
+================================================================================
+
+THE IDEA
+--------
+Buffer all keystrokes server-side. Only flush to PTY on Enter.
+No partial bytes can interleave — only complete commands reach PTY.
+
+  if (input === "\r" || input === "\n") {
+      stream.write(input);           // flush on Enter only
+      this.releaseOwnership(sessionId);
+  } else {
+      this.appendInputBuffer(sessionId, socket.id, input); // hold everything else
+  }
+
+
+WHY IT FAILS
+------------
+Buffering until Enter breaks PTY echo entirely.
+
+  Normal terminal:
+    User types "g" → PTY receives "g" → PTY echoes "g" → xterm shows "g"
+
+  With buffering:
+    User types "g" → server holds "g" → xterm shows NOTHING
+    User types "i" → server holds "gi" → xterm shows NOTHING
+    User types "t" → server holds "git" → xterm shows NOTHING
+    User hits Enter → "git" appears all at once → feels broken/frozen
+
+Additional breakage:
+  - Tab completion stops working (requires real PTY interaction)
+  - Arrow keys stop working
+  - Ctrl+C stops working
+  - vim, nano, python REPL — completely broken
+  - Buffer grows unbounded if Enter never pressed (memory leak)
+
+
+================================================================================
+PART 4 — ATTEMPT 3: SET ON EVERY KEYSTROKE
+================================================================================
+
+THE IDEA
+--------
+Write to PTY immediately (fixes UX), but broadcast lock via Redis SET + emit
+on every single keystroke.
+
+  socket.on("@@SSH_EMIT_INPUT", async (input: string) => {
+      stream.write(input);  // immediate — good
+
+      // SET and emit on EVERY keystroke
+      this.pubClient.set(`terminal:${sessionId}:lock`, socket.id, "EX", 5);
+      socket.to(sessionId).emit("@@SSH_PTY_LOCKED", {
+          lockedBy: socket.id,
+          expiresIn: 5000
+      });
+  });
+
+
+WHY IT FAILS AT SCALE
+---------------------
+  Operation                  | Per keystroke | At 8 keys/sec, 10 sessions
+  ---------------------------|---------------|---------------------------
+  stream.write()             | immediate     | fine
+  pubClient.set() to Redis   | 1 write       | 80 Redis writes/sec
+  socket.to().emit()         | 1 broadcast   | 80 WS broadcasts/sec
+  client setTimeout reset    | 1 timer reset | 80 timer resets/sec
+
+Lock state does not change between keystrokes.
+Broadcasting the same state 8 times per second is pure waste.
+
+
+================================================================================
+PART 5 — FINAL SOLUTION
+================================================================================
+
+THE CORE INSIGHT
+----------------
+Lock state only changes TWICE per typing session:
+  1. When it is acquired (first keystroke)
+  2. When it expires (5s idle or disconnect)
+
+Everything in between is the same state.
+Redis and broadcasts belong at the edges, not in the hot path.
+
+In-memory Map is the authority for per-keystroke decisions — not Redis.
+
+
+THE IMPLEMENTATION
+------------------
+
+  private lockMap = new Map<string, string>(); // sessionId → socket.id
+
+  socket.on("@@SSH_EMIT_INPUT", async (input: string) => {
+
+      const currentLock = this.lockMap.get(sessionId);
+
+      // Non-owner: reject instantly from memory, ZERO Redis
+      if (currentLock && currentLock !== socket.id) {
+          socket.emit("@@SSH_PTY_LOCKED", { lockedBy: currentLock });
+          return;
+      }
+
+      // Write to PTY immediately — nothing blocks this
+      stream.write(input);
+
+      // First keystroke only — set lock ONCE
+      if (!currentLock) {
+          this.lockMap.set(sessionId, socket.id);
+
+          // Redis SET once, fire and forget, does NOT block stream.write
+          this.pubClient.set(`terminal:${sessionId}:lock`, socket.id, "EX", 5);
+
+          // Notify room once — not on every key
+          socket.to(sessionId).emit("@@SSH_PTY_LOCKED", {
+              lockedBy: socket.id,
+              expiresIn: 5000
+          });
+
+          // Auto-release after 5s
+          setTimeout(() => {
+              if (this.lockMap.get(sessionId) === socket.id) {
+                  this.lockMap.delete(sessionId);
+                  io.to(sessionId).emit("@@SSH_PTY_UNLOCKED");
+              }
+          }, 5000);
+      }
+  });
+
+  // Hard disconnect — clean up immediately
+  socket.on("disconnect", () => {
+      if (this.lockMap.get(sessionId) === socket.id) {
+          this.lockMap.delete(sessionId);
+          io.to(sessionId).emit("@@SSH_PTY_UNLOCKED");
+          this.pubClient.del(`terminal:${sessionId}:lock`);
+      }
+  });
+
+
+FLOW — WHAT HAPPENS PER KEYSTROKE
+----------------------------------
+
+  FIRST KEYSTROKE (no existing lock):
+    socket "@@SSH_EMIT_INPUT"
+      ├─ lockMap.get() → undefined
+      ├─ stream.write(input)        ← IMMEDIATE
+      ├─ lockMap.set(sessionId, socket.id)
+      ├─ pubClient.SET lock EX 5    ← fire and forget, once
+      ├─ socket.to(room).emit LOCKED  ← once
+      └─ setTimeout(release, 5000)
+
+  2ND TO Nth KEYSTROKE (lock already set):
+    socket "@@SSH_EMIT_INPUT"
+      ├─ lockMap.get() → socket.id  (owner confirmed)
+      └─ stream.write(input)        ← IMMEDIATE, ZERO Redis
+
+  OTHER USER TRIES TO TYPE:
+    socket "@@SSH_EMIT_INPUT" from User B
+      ├─ lockMap.get() → userA_socket_id
+      ├─ currentLock !== socket.id → rejected
+      └─ socket.emit LOCKED         ← no PTY write, no Redis
+
+
+LATENCY COMPARISON
+------------------
+
+  Approach                  | Redis/keystroke       | Blocks write? | Latency added
+  --------------------------|-----------------------|---------------|---------------
+  Attempt 1 — GET every key | 1x GET (read)         | YES (awaited) | ~2–8ms per key
+  Attempt 2 — Buffer        | 1x GET+SET on first   | YES (buffered)| infinite (broken)
+  Attempt 3 — SET every key | 1x SET (write)        | NO            | 0ms but 8/sec
+  Final — lockMap + once    | once on first key only| NO            | zero after first
+
+
+OPERATIONS PER SECOND (8 keys/sec, 10 sessions)
+-------------------------------------------------
+  Approach   | Redis ops/sec       | WS broadcasts/sec   | Map lookups/sec
+  -----------|---------------------|---------------------|------------------
+  Attempt 1  | 80 GET/sec          | 80 emit/sec         | 0
+  Attempt 2  | 10 GET+SET/sec      | 10 emit/sec         | 0
+  Attempt 3  | 80 SET/sec          | 80 emit/sec         | 0
+  Final      | 10 SET TOTAL        | 10 emit TOTAL       | 800/sec (in-process)
+
+
+================================================================================
+PART 6 — SOCKET.IO ROOM JOIN
+================================================================================
+
+WHAT A ROOM IS
+--------------
+A Socket.IO room is just a string label. No registration, no creation step.
+
+  socket.join(sessionId);
+  //            ↑
+  //  This string IS the room.
+  //  sessionId you already have = valid room name.
+  //  Springs into existence on first join.
+  //  Disappears when last socket leaves.
+
+Every socket is always in two rooms:
+  socket.id   — private, auto-created by Socket.IO
+  sessionId   — shared terminal room, joined explicitly
+
+
+THE LATE-JOINER BUG (without rooms)
+-------------------------------------
+  User A connects at t=0, types, @@SSH_PTY_LOCKED fires.
+  User B connects at t=10s.
+  B was not in the room when @@SSH_PTY_LOCKED fired — missed it.
+  B can type freely. PTY gets corrupted. Lock is invisible to B.
+
+
+THE FIX — @@SSH_JOIN_TERMINAL + @@SSH_ROOM_STATE
+-------------------------------------------------
+
+  socket.on("@@SSH_JOIN_TERMINAL", async (sessionId: string) => {
+
+      socket.join(sessionId);  // sessionId string becomes the room
+
+      const sockets   = await io.in(sessionId).fetchSockets();
+      const userCount = sockets.length;
+
+      // Tell everyone else in the room
+      socket.to(sessionId).emit("@@SSH_USER_JOINED", {
+          socketId: socket.id,
+          userCount,
+          ts: Date.now()
+      });
+
+      // Send current lock state to joiner immediately
+      // This fixes the late-joiner problem
+      const currentLock = this.lockMap.get(sessionId) ?? null;
+      socket.emit("@@SSH_ROOM_STATE", {
+          lockedBy:  currentLock,
+          isLocked:  !!currentLock,
+          userCount,
+      });
+  });
+
+
+WHAT ROOMS REPLACE
+------------------
+  Before                                      | After
+  --------------------------------------------|--------------------------------------------
+  socket.to(sessionId) worked by convention   | socket must have joined — explicit membership
+  Late joiners miss @@SSH_PTY_LOCKED          | @@SSH_ROOM_STATE on join sends current state
+  User count needs manual counter map         | io.in(sessionId).fetchSockets().length
+  No join/leave events                        | @@SSH_USER_JOINED + @@SSH_USER_LEFT
+  Disconnect cleanup targets sessionId blindly| room membership confirms socket was in session
+
+
+================================================================================
+PART 7 — PRESENCE CHANNELS
+================================================================================
+
+THE FOUR CHANNELS + ROOM
+-------------------------
+  Primitive                   | Direction              | What travels          | Tech
+  ----------------------------|------------------------|-----------------------|---------------
+  Socket.IO room: sessionId   | server <-> all members | Scopes all broadcasts | Socket.IO
+  terminal:{id}:output        | PTY → all clients      | Raw PTY stdout bytes  | Redis Pub/Sub
+  terminal:{id}:input         | owner → all clients    | Keystroke mirror only | Redis Pub/Sub
+  terminal:{id}:presence      | server → all clients   | Who is connected      | Redis Pub/Sub
+  terminal:{id}:commands      | owner → PTY worker     | Actual PTY writes     | Redis Streams
+
+KEY PRINCIPLE: Only :commands ever touches the PTY.
+               :input is display only — never written to PTY.
+               Socket.IO room scopes broadcasts — Redis carries data.
+
+
+:input CHANNEL PAYLOAD
+-----------------------
+  {
+    "userId":      "user_a",
+    "displayName": "Alice",
+    "key":         "t",
+    "buffer":      "git statu",
+    "cursor":      9,
+    "ts":          1712345678901
+  }
+
+Control characters: send named strings, not escape sequences.
+  Backspace  → key: "Backspace", update buffer string
+  Ctrl+C     → key: "^C", clear buffer
+  Arrow keys → key: "ArrowLeft" etc, update cursor
+
+
+:presence CHANNEL PAYLOAD
+--------------------------
+  {
+    "terminalId": "term_abc",
+    "token": 42,
+    "users": [
+      { "id": "user_a", "status": "owner",   "typingBuffer": "git status" },
+      { "id": "user_b", "status": "queued",  "typingBuffer": "ls -la" },
+      { "id": "user_c", "status": "watching","typingBuffer": null }
+    ],
+    "ts": 1712345700000
+  }
+
+Publish on: user connect, user disconnect, ownership change, queue update.
+
+
+================================================================================
+PART 8 — REDIS LOCK TIMING
+================================================================================
+
+THREE SEPARATE TIMERS — DIFFERENT JOBS
+---------------------------------------
+  Operation  | Type      | Interval       | Redis call
+  -----------|-----------|----------------|---------------------------
+  Claim      | Immediate | once           | SET NX (or just SET EX 5)
+  Keepalive  | Throttle  | every 2s       | EXPIRE only
+  Release    | Debounce  | 3s after idle  | DEL
+
+WHY:
+  - Debounce on keepalive = WRONG. If user types continuously for 6s and
+    debounce never fires, TTL expires and lock dies mid-session.
+  - Use THROTTLE for keepalive (fires while active).
+  - Use DEBOUNCE for release (fires after user stops).
+
+TTL RULE:
+  TTL must always be >= 3x keepalive interval.
+  Keepalive = 2s → TTL = 6s.
+  One missed refresh does not kill the lock.
+
+
+================================================================================
+PART 9 — QUICK REFERENCE
+================================================================================
+
+SOCKET EVENTS
+-------------
+  Event                  | Direction        | When                          | Payload
+  -----------------------|------------------|-------------------------------|---------------------------
+  @@SSH_JOIN_TERMINAL    | client → server  | user opens shared terminal    | sessionId: string
+  @@SSH_ROOM_STATE       | server → joiner  | immediately on join           | { lockedBy, isLocked, userCount }
+  @@SSH_USER_JOINED      | server → room    | new socket joins              | { socketId, userCount }
+  @@SSH_USER_LEFT        | server → room    | socket disconnects            | { socketId, userCount }
+  @@SSH_EMIT_DATA        | server → client  | PTY produces output           | text: string
+  @@SSH_EMIT_INPUT       | client → server  | user presses any key          | input: string
+  @@SSH_PTY_LOCKED       | server → room    | first keystroke by new owner  | { lockedBy, expiresIn }
+  @@SSH_PTY_UNLOCKED     | server → room    | lock expires or disconnect    | {}
+
+
+REDIS KEYS
+----------
+  Key                      | Type            | Value                   | TTL
+  -------------------------|-----------------|-------------------------|-------
+  terminal:{id}            | Pub/Sub channel | Raw PTY stdout bytes    | N/A
+  terminal:{id}:lock       | String          | socket.id of owner      | 5s
+  terminal:{id}:input      | Pub/Sub channel | Keystroke mirror JSON   | N/A
+  terminal:{id}:presence   | Pub/Sub channel | Full presence state     | N/A
+  terminal:{id}:commands   | Redis Stream    | Validated PTY commands  | N/A
+
+
+SCENARIO → OPERATION
+---------------------
+  Scenario                | What happens                       | Operation
+  ------------------------|------------------------------------|--------------------------------
+  User opens terminal     | Joins room, gets current state     | socket.join() + ROOM_STATE emit
+  First keystroke         | Lock set once                      | lockMap.set() + Redis SET EX 5
+  2nd–Nth keystrokes      | PTY write, no Redis                | stream.write() + lockMap check
+  Non-owner keystroke     | Rejected from memory               | lockMap check only, no Redis
+  Lock expires (5s)       | Room unlocked                      | setTimeout → io.to(room) UNLOCKED
+  User disconnects        | Lock released if owner             | lockMap.delete() + DEL + emit
+  PTY produces output     | Broadcast to room                  | PUBLISH :output → room emit
+
+
+HARD RULES — NEVER VIOLATE
+---------------------------
+  1. stream.write() must NEVER be blocked by any async operation
+  2. lockMap is the authority for per-keystroke decisions — not Redis
+  3. Redis is for persistence and cross-server sync only
+  4. @@SSH_PTY_LOCKED emitted ONCE per lock acquisition — not per keystroke
+  5. TTL must always be >= 3x keepalive interval
+  6. disconnect handler must clean lockMap and emit UNLOCKED synchronously
+  7. :input payloads must NEVER be forwarded to the PTY under any condition
+  8. Everyone goes through @@SSH_JOIN_TERMINAL including the terminal owner
+
+
+================================================================================
+EOF
+================================================================================

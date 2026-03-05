@@ -64,7 +64,11 @@ class SFTP_Service {
         // Clean up any stale session with this id
         await this.disconnect(sftpSessionId);
 
-        const client = new SFTPClient();
+        const client = new SFTPClient('sftp', {
+            error: (err: Error) => Logging.dev(`SFTP global error [${sftpSessionId}]: ${err.message}`, 'error'),
+            end: () => Logging.dev(`SFTP global end [${sftpSessionId}]`, 'notice'),
+            close: () => Logging.dev(`SFTP global close [${sftpSessionId}]`, 'notice'),
+        });
         try {
             await client.connect(options);
             this.sessions.set(sftpSessionId, client);
