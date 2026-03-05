@@ -86,6 +86,7 @@ export class CollaborativeTerminal {
 
     /** Register all collaborative events on a socket. */
     register(socket: Socket, sessionId: string) {
+        this.onCheckRoom(socket, sessionId);
         this.onJoinTerminal(socket, sessionId);
         this.onInput(socket, sessionId);
         this.onAdminLock(socket, sessionId);
@@ -94,6 +95,26 @@ export class CollaborativeTerminal {
         this.onBlockUser(socket, sessionId);
         this.onUnblockIP(socket, sessionId);
         this.onDisconnect(socket, sessionId);
+    }
+
+    /* ════════════════════════════════════════════════════════════════════════
+     *  Room check — lightweight probe before joining
+     * ══════════════════════════════════════════════════════════════════════ */
+
+    private onCheckRoom(socket: Socket, sessionId: string) {
+        socket.on(E.COLLAB_CHECK_ROOM, () => {
+            const session = this.sessionMap.get(sessionId);
+            const exists = !!session;
+
+            const ip = this.resolveIP(socket);
+            const blocked = exists ? session.blockedIPs.has(ip) : false;
+
+            socket.emit(E.COLLAB_ROOM_STATUS, {
+                exists,
+                blocked,
+                userCount: exists ? session.connectedSockets.size : 0,
+            });
+        });
     }
 
     /* ════════════════════════════════════════════════════════════════════════
@@ -218,7 +239,7 @@ export class CollaborativeTerminal {
             }
 
             // ── 4. All clear — write to PTY immediately ────────────────
-            stream.write(input);
+            if (input != null) stream.write(input);
 
             // ── 5. "700" users trigger / reset auto-lock ────────────────
             if (perm === "700") {
@@ -433,14 +454,25 @@ export class CollaborativeTerminal {
             const session = this.sessionMap.get(sessionId);
             if (!session) return;
 
+            const isAdmin = socket.id === session.adminSocketId;
+
             // ── Remove from session (also releases auto-lock if held) ───
             this.removeSocket(sessionId, socket.id);
 
-            const userCount = session.connectedSockets.size;
-            this.io.to(this.room(sessionId)).emit(E.COLLAB_USER_LEFT, {
-                socketId: socket.id,
-                userCount,
-            });
+            if (isAdmin) {
+                // Admin left → session is over for everyone
+                this.io.to(this.room(sessionId)).emit(E.COLLAB_SESSION_ENDED, {
+                    reason: "admin-disconnected",
+                    message: "Session ended — the admin has disconnected.",
+                });
+                this.destroySession(sessionId);
+            } else {
+                const userCount = session.connectedSockets.size;
+                this.io.to(this.room(sessionId)).emit(E.COLLAB_USER_LEFT, {
+                    socketId: socket.id,
+                    userCount,
+                });
+            }
         });
     }
 

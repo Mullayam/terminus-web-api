@@ -117,6 +117,9 @@ export class SocketListener extends EventEmitter {
                 this.sharedTerminalSessions.delete(sid);
 
                 if (socket.id === info.adminSocketId) {
+                    // Notify all connected sockets that the session is over
+                    this.io.to(`terminal:${sid}`).emit(E.SESSIONN_END, "Session ended — the admin has disconnected.");
+
                     this.sessions.get(sid)?.end();
                     this.sessions.delete(sid);
                     delete this.sessionInfo[sid];
@@ -352,7 +355,9 @@ export class SocketListener extends EventEmitter {
 
         this.emit("shell-ready", { sessionId, stream, socket });
 
-        socket.on(E.SSH_EMIT_INPUT, (input: string) => stream.write(input));
+        socket.on(E.SSH_EMIT_INPUT, (input: string) => {
+            if (input != null) stream.write(input);
+        });
 
         socket.on(E.SSH_EMIT_RESIZE, (size: { cols: number; rows: number }) => {
             const info = this.sessionInfo[sessionId];

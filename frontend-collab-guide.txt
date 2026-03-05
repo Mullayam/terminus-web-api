@@ -1,0 +1,289 @@
+================================================================================
+  COLLABORATIVE TERMINAL — FRONTEND INTEGRATION GUIDE
+================================================================================
+
+  Backend:  Socket.IO (main "/" namespace)
+  Events:   Prefixed with "@@"
+
+================================================================================
+  1. PERMISSION MODEL
+================================================================================
+
+  "400"  →  Read-only. Can see output, cannot type.
+  "700"  →  Write. Can type. Subject to auto-lock by other "700" users.
+  "777"  →  Admin / Owner. Full access. Immune to all locks.
+
+  New joiners default to "400". Admin is always "777".
+
+================================================================================
+  2. LOCK TYPES
+================================================================================
+
+  "auto"   →  Created automatically when a "700" user types.
+              4-second TTL, resets on each keystroke.
+              Blocks other "700" users. Does NOT block "777".
+
+  "admin"  →  Set manually by admin. No TTL. Blocks everyone except "777".
+              Overrides any active auto-lock.
+
+================================================================================
+  3. EVENTS — CLIENT → SERVER  (what FE emits)
+================================================================================
+
+  @@COLLAB_CHECK_ROOM
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Before joining — check if the session exists and is joinable.
+  Payload:  (none)
+  Response: Server emits @@COLLAB_ROOM_STATUS (see section 4)
+
+  @@COLLAB_JOIN_TERMINAL
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     User wants to join a shared terminal session.
+  Payload:  { sessionId: string }
+
+  @@COLLAB_INPUT
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     User types in the terminal (every keystroke).
+  Payload:  string  (raw input, e.g. "ls\r")
+  Note:     Only emit if you believe user has write access.
+            Server will reject + notify if they don't.
+
+  @@COLLAB_ADMIN_LOCK                                            [ADMIN ONLY]
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Admin toggles manual lock on/off.
+  Payload:  { sessionId: string, lock: boolean }
+
+  @@COLLAB_CHANGE_PERMISSION                                     [ADMIN ONLY]
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Admin changes a user's permission level.
+  Payload:  { sessionId: string, targetSocketId: string, permission: "400" | "700" }
+  Note:     Cannot promote to "777". Cannot change own permission.
+
+  @@COLLAB_KICK_USER                                             [ADMIN ONLY]
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Admin removes a user (they CAN rejoin).
+  Payload:  { sessionId: string, targetSocketId: string, message?: string }
+
+  @@COLLAB_BLOCK_USER                                            [ADMIN ONLY]
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Admin blocks a user's IP (they CANNOT rejoin this session).
+  Payload:  { sessionId: string, targetSocketId: string, message?: string }
+
+  @@COLLAB_UNBLOCK_IP                                            [ADMIN ONLY]
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Admin unblocks a previously blocked IP.
+  Payload:  { sessionId: string, ip: string }
+
+================================================================================
+  4. EVENTS — SERVER → CLIENT  (what FE listens to)
+================================================================================
+
+  @@COLLAB_ROOM_STATUS
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Response to @@COLLAB_CHECK_ROOM.
+  Payload:  {
+              exists:    boolean,   // true if sessionId maps to a live session
+              blocked:   boolean,   // true if your IP is blocked from this session
+              userCount: number     // current users (0 if session doesn't exist)
+            }
+  Action:   - exists=false → show "Session not found" page, don't attempt join
+            - blocked=true → show "You've been blocked" page, don't attempt join
+            - exists=true && blocked=false → safe to emit @@COLLAB_JOIN_TERMINAL
+
+  @@COLLAB_ROOM_STATE
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Immediately after joining successfully.
+  Payload:  {
+              lockedBy:   string | null,   // socket.id of lock holder, or null
+              lockType:   "auto" | "admin" | null,
+              isLocked:   boolean,
+              permission: "400" | "700" | "777",
+              userCount:  number,
+              isAdmin:    boolean
+            }
+  Action:   Initialize your local collab state from this.
+            - Set terminal read-only if permission is "400"
+            - Show lock indicator if isLocked
+            - Show admin controls if isAdmin
+
+  @@COLLAB_TERMINAL_OUTPUT
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Any terminal output from the PTY (via Redis pub/sub).
+  Payload:  string  (raw terminal output, write to xterm)
+  Action:   xterm.write(payload)
+
+  @@COLLAB_USER_JOINED
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     A new user joins the session.
+  Payload (non-admin):  { socketId: string, userCount: number }
+  Payload (admin gets): { socketId: string, ip: string, userCount: number }
+  Action:   Update user count in UI.
+            Admin: add user to management panel (with IP for block controls).
+
+  @@COLLAB_USER_LEFT
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     A non-admin user disconnects or is kicked/blocked.
+  Payload:  { socketId: string, userCount: number }
+  Action:   Update user count. Remove user from admin panel if applicable.
+
+  @@COLLAB_PTY_LOCKED
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Terminal gets locked (auto or admin).
+  Payload:  {
+              lockedBy:  string,              // socket.id of lock holder
+              type:      "auto" | "admin",
+              expiresIn?: number              // ms, only for "auto" locks (~4000)
+            }
+  Action:   Show lock indicator.
+            - "auto": "Someone is typing..." (optional countdown)
+            - "admin": "Terminal locked by admin"
+            Disable input for "700" users. "777" is unaffected.
+
+  @@COLLAB_PTY_UNLOCKED
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Lock is released (auto expired or admin toggled off).
+  Payload:  {}
+  Action:   Hide lock indicator. Re-enable input for "700" users.
+
+  @@COLLAB_PERMISSION_CHANGED
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Admin changed YOUR permission.
+  Payload:  { permission: "400" | "700" }
+  Action:   Update local permission state.
+            - "400": disable input, show "Read-only" badge
+            - "700": enable input (subject to locks)
+
+  @@COLLAB_INPUT_REJECTED
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     You tried to type but server rejected it.
+  Payload:  {
+              reason:  "read-only" | "locked-auto" | "locked-admin",
+              message: string   // human-readable explanation
+            }
+  Action:   Show toast/notification with message.
+            Optionally disable input to prevent spam.
+
+  @@COLLAB_USER_KICKED
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     YOU were kicked by admin. You can rejoin.
+  Payload:  { message: string }
+  Action:   Show message. Tear down terminal. Optionally show "Rejoin" button.
+
+  @@COLLAB_USER_BLOCKED
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     YOU were blocked by admin. Cannot rejoin this session.
+  Payload:  { message: string }
+  Action:   Show message. Tear down terminal. No rejoin option.
+
+  @@COLLAB_JOIN_REJECTED
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Your join attempt was rejected.
+  Payload:  {
+              reason:  "blocked" | "session-not-found",
+              message: string
+            }
+  Action:   - "session-not-found": session ended or invalid URL → redirect
+            - "blocked": show blocked message, no retry
+
+  @@COLLAB_SESSION_ENDED
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Admin disconnected → entire session is dead.
+  Payload:  {
+              reason:  "admin-disconnected",
+              message: "Session ended — the admin has disconnected."
+            }
+  Action:   Show error overlay / toast with message.
+            Disable all terminal input.
+            Clean up local collab state (locks, user list, etc.).
+            Do NOT attempt to reconnect or re-join.
+
+  @@SESSIONN_END
+  ─────────────────────────────────────────────────────────────────────────────
+  When:     Admin disconnected (regular shared terminal, non-collab path).
+  Payload:  string  ("Session ended — the admin has disconnected.")
+  Action:   Same as COLLAB_SESSION_ENDED — show error, disable input, clean up.
+  Note:     Listen to this if you're on the regular terminal-sharing path
+            (not collaborative). If you're on collab, COLLAB_SESSION_ENDED
+            is the one you need.
+
+================================================================================
+  5. TYPICAL FE FLOW
+================================================================================
+
+  JOINER (non-admin):
+  ─────────────────────────────────────────────────────────────────────────────
+  1.  Connect socket to "/"
+  2.  Emit  @@COLLAB_CHECK_ROOM  (no payload)
+  3.  Listen for @@COLLAB_ROOM_STATUS:
+        - exists=false → show "Session not found", stop
+        - blocked=true → show "You're blocked", stop
+        - otherwise    → proceed to step 4
+  4.  Emit  @@COLLAB_JOIN_TERMINAL  { sessionId }
+  5.  Listen for @@COLLAB_JOIN_REJECTED → handle error, stop
+  6.  Listen for @@COLLAB_ROOM_STATE  → initialize UI state
+  5.  Listen for @@COLLAB_TERMINAL_OUTPUT → xterm.write()
+  6.  On keypress → emit @@COLLAB_INPUT (string)
+  7.  Listen for @@COLLAB_INPUT_REJECTED → show toast
+  8.  Listen for @@COLLAB_PTY_LOCKED / @@COLLAB_PTY_UNLOCKED → update lock UI
+  9.  Listen for @@COLLAB_PERMISSION_CHANGED → update local permission
+  10. Listen for @@COLLAB_USER_KICKED → teardown + "Rejoin" option
+  11. Listen for @@COLLAB_USER_BLOCKED → teardown, no rejoin
+  12. Listen for @@COLLAB_SESSION_ENDED → teardown, session is dead
+
+  ADMIN:
+  ─────────────────────────────────────────────────────────────────────────────
+  1.  Session is created server-side when SSH shell opens (admin auto-joins)
+  2.  Listen for @@COLLAB_USER_JOINED → add user to panel (has ip + socketId)
+  3.  Listen for @@COLLAB_USER_LEFT → remove user from panel, update count
+  4.  Emit  @@COLLAB_ADMIN_LOCK       to toggle lock
+  5.  Emit  @@COLLAB_CHANGE_PERMISSION to promote/demote users
+  6.  Emit  @@COLLAB_KICK_USER        to kick
+  7.  Emit  @@COLLAB_BLOCK_USER       to block (kick + IP ban)
+  8.  Emit  @@COLLAB_UNBLOCK_IP       to unblock a banned IP
+
+================================================================================
+  6. STATE TO TRACK ON FRONTEND
+================================================================================
+
+  interface CollabState {
+    sessionId:    string;
+    isAdmin:      boolean;
+    permission:   "400" | "700" | "777";
+    userCount:    number;
+    isLocked:     boolean;
+    lockedBy:     string | null;
+    lockType:     "auto" | "admin" | null;
+    sessionEnded: boolean;
+
+    // Admin-only:
+    users: Array<{
+      socketId: string;
+      ip?: string;          // only admin receives this
+      permission: "400" | "700";
+    }>;
+    blockedIPs: string[];   // track locally for unblock UI
+  }
+
+================================================================================
+  7. EDGE CASES TO HANDLE
+================================================================================
+
+  - Emit null/undefined input: DON'T. Server guards against it, but don't
+    send empty keystrokes.
+
+  - Multiple rapid permission changes: Always trust the latest
+    @@COLLAB_PERMISSION_CHANGED — it's authoritative.
+
+  - Auto-lock expiry: Server broadcasts @@COLLAB_PTY_UNLOCKED when the 4s
+    timer fires. You don't need a client-side timer — just react to events.
+    The expiresIn field is informational (for countdown UI if you want one).
+
+  - Session ended + kicked at same time: If you receive both
+    @@COLLAB_USER_KICKED and @@COLLAB_SESSION_ENDED, treat session-ended
+    as the final state. First event wins for UI teardown.
+
+  - Admin reconnect: If admin's browser refreshes, the old admin socket
+    becomes inert. The new socket takes over as admin. Connected users
+    stay in the room. No event is emitted for this swap — it's seamless.
+
+================================================================================
