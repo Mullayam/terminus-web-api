@@ -1,6 +1,7 @@
 import { Server, Socket } from "socket.io";
 import { RedisClientType } from "redis";
 import type { ClientChannel } from "ssh2";
+import { Logging } from "@enjoys/express-utils/logger";
 import type { SocketPermission } from "./types";
 import { SocketEventConstants } from "./events";
 import type {
@@ -22,7 +23,7 @@ const E = SocketEventConstants;
 const AUTO_LOCK_TTL = 4_000; // ms
 
 /**
- * Collaborative terminal handler — testing-only, standalone class.
+ * Collaborative terminal handler.
  *
  * Owns:
  *  - Per-session lock (auto + admin)
@@ -34,6 +35,10 @@ const AUTO_LOCK_TTL = 4_000; // ms
  *  - SSH connection lifecycle (passed in)
  *  - Session creation / teardown (caller's job)
  *  - Redis pub/sub for terminal output (caller publishes — we subscribe + relay)
+ *
+ * ALL event handlers read sessionId from their payload at runtime.
+ * registerAll(socket) is called for EVERY connecting socket — no sessionId
+ * is required at registration time.
  */
 export class CollaborativeTerminal {
     /** sessionId → lock state */
@@ -42,6 +47,8 @@ export class CollaborativeTerminal {
     private sessionMap = new Map<string, CollaborativeSession>();
     /** sessionId → PTY stream (caller binds after SSH shell opens) */
     private streams = new Map<string, ClientChannel>();
+    /** socketId → set of sessionIds they've joined (for disconnect cleanup) */
+    private socketSessions = new Map<string, Set<string>>();
 
     constructor(
         private readonly io: Server,
@@ -65,6 +72,8 @@ export class CollaborativeTerminal {
             socketIPs: new Map(),
         });
 
+        this.trackSocket(adminSocketId, sessionId);
+
         // Admin must join the collab room to receive lock/unlock/user broadcasts
         const adminSocket = this.io.sockets.sockets.get(adminSocketId);
         adminSocket?.join(this.room(sessionId));
@@ -84,30 +93,43 @@ export class CollaborativeTerminal {
         this.streams.delete(sessionId);
     }
 
-    /** Register all collaborative events on a socket. */
-    register(socket: Socket, sessionId: string) {
-        this.onCheckRoom(socket, sessionId);
-        this.onJoinTerminal(socket, sessionId);
-        this.onInput(socket, sessionId);
-        this.onAdminLock(socket, sessionId);
-        this.onChangePermission(socket, sessionId);
-        this.onKickUser(socket, sessionId);
-        this.onBlockUser(socket, sessionId);
-        this.onUnblockIP(socket, sessionId);
-        this.onDisconnect(socket, sessionId);
+    /**
+     * Register ALL collaborative event listeners on a socket.
+     * Call for EVERY connecting socket — no sessionId required.
+     * Each handler reads sessionId from its payload at runtime.
+     */
+    registerAll(socket: Socket) {
+        this.onCheckRoom(socket);
+        this.onJoinTerminal(socket);
+        this.onInput(socket);
+        this.onAdminLock(socket);
+        this.onChangePermission(socket);
+        this.onKickUser(socket);
+        this.onBlockUser(socket);
+        this.onUnblockIP(socket);
+        this.onDisconnect(socket);
     }
 
     /* ════════════════════════════════════════════════════════════════════════
      *  Room check — lightweight probe before joining
      * ══════════════════════════════════════════════════════════════════════ */
 
-    private onCheckRoom(socket: Socket, sessionId: string) {
-        socket.on(E.COLLAB_CHECK_ROOM, () => {
-            const session = this.sessionMap.get(sessionId);
-            const exists = !!session;
+    private onCheckRoom(socket: Socket) {
+        socket.on(E.COLLAB_CHECK_ROOM, (payload?: { sessionId?: string }) => {
+            const sid = payload?.sessionId ?? (socket.handshake.query.sessionId as string);
+            Logging.dev(`��� CHECK_ROOM from ${socket.id} | sid=${sid}`);
 
+            if (!sid) {
+                socket.emit(E.COLLAB_ROOM_STATUS, { exists: false, blocked: false, userCount: 0 });
+                return;
+            }
+
+            const session = this.sessionMap.get(sid);
+            const exists = !!session;
             const ip = this.resolveIP(socket);
             const blocked = exists ? session.blockedIPs.has(ip) : false;
+
+            Logging.dev(`��� CHECK_ROOM → exists=${exists} blocked=${blocked} sessions=[${[...this.sessionMap.keys()].join(", ")}]`);
 
             socket.emit(E.COLLAB_ROOM_STATUS, {
                 exists,
@@ -118,11 +140,20 @@ export class CollaborativeTerminal {
     }
 
     /* ════════════════════════════════════════════════════════════════════════
-     *  Room join
+     *  Room join — sessionId comes from the payload
      * ══════════════════════════════════════════════════════════════════════ */
 
-    private onJoinTerminal(socket: Socket, sessionId: string) {
-        socket.on(E.COLLAB_JOIN_TERMINAL, async (_payload: JoinTerminalPayload) => {
+    private onJoinTerminal(socket: Socket) {
+        socket.on(E.COLLAB_JOIN_TERMINAL, async (payload: JoinTerminalPayload) => {
+            const sessionId = payload?.sessionId;
+            if (!sessionId) {
+                socket.emit(E.COLLAB_JOIN_REJECTED, {
+                    reason: "session-not-found",
+                    message: "No session ID provided.",
+                });
+                return;
+            }
+
             const session = this.sessionMap.get(sessionId);
             if (!session) {
                 socket.emit(E.COLLAB_JOIN_REJECTED, {
@@ -147,6 +178,7 @@ export class CollaborativeTerminal {
             socket.join(room);
             session.connectedSockets.add(socket.id);
             session.socketIPs.set(socket.id, ip);
+            this.trackSocket(socket.id, sessionId);
 
             // Default permission for new joiners: read-only.
             // Admin is already set to "777" in createSession.
@@ -194,10 +226,14 @@ export class CollaborativeTerminal {
 
     /* ════════════════════════════════════════════════════════════════════════
      *  Input (keystroke) handling — the hot path
+     *  sessionId resolved from socketSessions (set during join)
      * ══════════════════════════════════════════════════════════════════════ */
 
-    private onInput(socket: Socket, sessionId: string) {
+    private onInput(socket: Socket) {
         socket.on(E.COLLAB_INPUT, (input: string) => {
+            const sessionId = this.findSessionForSocket(socket.id);
+            if (!sessionId) return;
+
             const session = this.sessionMap.get(sessionId);
             if (!session) return;
 
@@ -293,13 +329,13 @@ export class CollaborativeTerminal {
      *  Admin lock — manual, no TTL
      * ══════════════════════════════════════════════════════════════════════ */
 
-    private onAdminLock(socket: Socket, sessionId: string) {
+    private onAdminLock(socket: Socket) {
         socket.on(E.COLLAB_ADMIN_LOCK, (payload: AdminLockPayload) => {
+            const { sessionId, lock } = payload;
             const session = this.sessionMap.get(sessionId);
             if (!session || socket.id !== session.adminSocketId) return;
 
-            if (payload.lock) {
-                // Clear any existing auto-lock timer
+            if (lock) {
                 const existing = this.lockMap.get(sessionId);
                 if (existing?.timer) clearTimeout(existing.timer);
 
@@ -314,7 +350,6 @@ export class CollaborativeTerminal {
                 };
                 this.io.to(this.room(sessionId)).emit(E.COLLAB_PTY_LOCKED, locked);
             } else {
-                // Unlock
                 const existing = this.lockMap.get(sessionId);
                 if (existing?.timer) clearTimeout(existing.timer);
                 this.lockMap.delete(sessionId);
@@ -327,39 +362,28 @@ export class CollaborativeTerminal {
      *  Permission change — immediate effect
      * ══════════════════════════════════════════════════════════════════════ */
 
-    private onChangePermission(socket: Socket, sessionId: string) {
+    private onChangePermission(socket: Socket) {
         socket.on(E.COLLAB_CHANGE_PERMISSION, (payload: ChangePermissionPayload) => {
+            const { sessionId, targetSocketId, permission } = payload;
             const session = this.sessionMap.get(sessionId);
             if (!session || socket.id !== session.adminSocketId) return;
 
-            const { targetSocketId, permission } = payload;
-
-            // Don't allow changing admin's own permission
             if (targetSocketId === session.adminSocketId) return;
-
-            // Don't allow promoting to "777" (only one admin)
             if (permission === "777") return;
 
             const oldPerm = session.permissions.get(targetSocketId);
             session.permissions.set(targetSocketId, permission);
 
-            // Notify the target immediately
             this.io.to(targetSocketId).emit(E.COLLAB_PERMISSION_CHANGED, {
                 permission,
             });
 
-            // If downgraded to "400" and they held the auto-lock → revoke
-            if (
-                permission === "400" &&
-                oldPerm === "700"
-            ) {
+            if (permission === "400" && oldPerm === "700") {
                 const lock = this.lockMap.get(sessionId);
                 if (lock?.type === "auto" && lock.holder === targetSocketId) {
                     if (lock.timer) clearTimeout(lock.timer);
                     this.lockMap.delete(sessionId);
-                    this.io
-                        .to(this.room(sessionId))
-                        .emit(E.COLLAB_PTY_UNLOCKED, {});
+                    this.io.to(this.room(sessionId)).emit(E.COLLAB_PTY_UNLOCKED, {});
                 }
             }
         });
@@ -369,26 +393,22 @@ export class CollaborativeTerminal {
      *  Kick — remove from session, they can rejoin
      * ══════════════════════════════════════════════════════════════════════ */
 
-    private onKickUser(socket: Socket, sessionId: string) {
+    private onKickUser(socket: Socket) {
         socket.on(E.COLLAB_KICK_USER, (payload: KickUserPayload) => {
+            const { sessionId, targetSocketId, message } = payload;
             const session = this.sessionMap.get(sessionId);
             if (!session || socket.id !== session.adminSocketId) return;
-
-            const { targetSocketId, message } = payload;
-            if (targetSocketId === session.adminSocketId) return; // can't kick yourself
+            if (targetSocketId === session.adminSocketId) return;
 
             this.removeSocket(sessionId, targetSocketId);
 
-            // Notify the kicked user
             this.io.to(targetSocketId).emit(E.COLLAB_USER_KICKED, {
                 message: message ?? "The admin removed you from this session. You can rejoin if you'd like.",
             });
 
-            // Force leave the room (socket stays connected to Socket.IO)
             const targetSocket = this.io.sockets.sockets.get(targetSocketId);
             targetSocket?.leave(this.room(sessionId));
 
-            // Broadcast updated count
             const userCount = session.connectedSockets.size;
             this.io.to(this.room(sessionId)).emit(E.COLLAB_USER_LEFT, {
                 socketId: targetSocketId,
@@ -401,23 +421,18 @@ export class CollaborativeTerminal {
      *  Block — kick + ban IP for this session
      * ══════════════════════════════════════════════════════════════════════ */
 
-    private onBlockUser(socket: Socket, sessionId: string) {
+    private onBlockUser(socket: Socket) {
         socket.on(E.COLLAB_BLOCK_USER, (payload: BlockUserPayload) => {
+            const { sessionId, targetSocketId, message } = payload;
             const session = this.sessionMap.get(sessionId);
             if (!session || socket.id !== session.adminSocketId) return;
-
-            const { targetSocketId, message } = payload;
             if (targetSocketId === session.adminSocketId) return;
 
-            // Record the IP before removing the socket
             const ip = session.socketIPs.get(targetSocketId);
-            if (ip) {
-                session.blockedIPs.add(ip);
-            }
+            if (ip) session.blockedIPs.add(ip);
 
             this.removeSocket(sessionId, targetSocketId);
 
-            // Notify then force leave
             this.io.to(targetSocketId).emit(E.COLLAB_USER_BLOCKED, {
                 message: message ?? "The admin has blocked you from this session. You won't be able to rejoin.",
             });
@@ -437,42 +452,47 @@ export class CollaborativeTerminal {
      *  Unblock — remove IP from session block list
      * ══════════════════════════════════════════════════════════════════════ */
 
-    private onUnblockIP(socket: Socket, sessionId: string) {
+    private onUnblockIP(socket: Socket) {
         socket.on(E.COLLAB_UNBLOCK_IP, (payload: UnblockIPPayload) => {
+            const { sessionId, ip } = payload;
             const session = this.sessionMap.get(sessionId);
             if (!session || socket.id !== session.adminSocketId) return;
-            session.blockedIPs.delete(payload.ip);
+            session.blockedIPs.delete(ip);
         });
     }
 
     /* ════════════════════════════════════════════════════════════════════════
-     *  Disconnect cleanup
+     *  Disconnect cleanup — iterates all sessions this socket joined
      * ══════════════════════════════════════════════════════════════════════ */
 
-    private onDisconnect(socket: Socket, sessionId: string) {
+    private onDisconnect(socket: Socket) {
         socket.on("disconnect", () => {
-            const session = this.sessionMap.get(sessionId);
-            if (!session) return;
+            const sessions = this.socketSessions.get(socket.id);
+            if (!sessions) return;
 
-            const isAdmin = socket.id === session.adminSocketId;
+            for (const sessionId of sessions) {
+                const session = this.sessionMap.get(sessionId);
+                if (!session) continue;
 
-            // ── Remove from session (also releases auto-lock if held) ───
-            this.removeSocket(sessionId, socket.id);
+                const isAdmin = socket.id === session.adminSocketId;
+                this.removeSocket(sessionId, socket.id);
 
-            if (isAdmin) {
-                // Admin left → session is over for everyone
-                this.io.to(this.room(sessionId)).emit(E.COLLAB_SESSION_ENDED, {
-                    reason: "admin-disconnected",
-                    message: "Session ended — the admin has disconnected.",
-                });
-                this.destroySession(sessionId);
-            } else {
-                const userCount = session.connectedSockets.size;
-                this.io.to(this.room(sessionId)).emit(E.COLLAB_USER_LEFT, {
-                    socketId: socket.id,
-                    userCount,
-                });
+                if (isAdmin) {
+                    this.io.to(this.room(sessionId)).emit(E.COLLAB_SESSION_ENDED, {
+                        reason: "admin-disconnected",
+                        message: "Session ended — the admin has disconnected.",
+                    });
+                    this.destroySession(sessionId);
+                } else {
+                    const userCount = session.connectedSockets.size;
+                    this.io.to(this.room(sessionId)).emit(E.COLLAB_USER_LEFT, {
+                        socketId: socket.id,
+                        userCount,
+                    });
+                }
             }
+
+            this.socketSessions.delete(socket.id);
         });
     }
 
@@ -481,7 +501,6 @@ export class CollaborativeTerminal {
      * ══════════════════════════════════════════════════════════════════════ */
 
     private onTerminalOutput = (message: string, channel: string) => {
-        // channel = "terminal:{sessionId}"
         const sessionId = channel.split(":")[1];
         const session = this.sessionMap.get(sessionId);
         if (!session) return;
@@ -497,7 +516,6 @@ export class CollaborativeTerminal {
         return `collab:${sessionId}`;
     }
 
-    /** Resolve IP from socket handshake (supports proxies via x-forwarded-for) */
     private resolveIP(socket: Socket): string {
         const forwarded = socket.handshake.headers["x-forwarded-for"];
         if (typeof forwarded === "string") {
@@ -506,13 +524,26 @@ export class CollaborativeTerminal {
         return socket.handshake.address;
     }
 
-    /** Get effective permission. Admin is always "777". */
-    private getPermission(
-        session: CollaborativeSession,
-        socketId: string,
-    ): SocketPermission {
+    private getPermission(session: CollaborativeSession, socketId: string): SocketPermission {
         if (socketId === session.adminSocketId) return "777";
         return session.permissions.get(socketId) ?? "400";
+    }
+
+    /** Track that a socket is part of a session (for disconnect cleanup). */
+    private trackSocket(socketId: string, sessionId: string) {
+        let set = this.socketSessions.get(socketId);
+        if (!set) {
+            set = new Set();
+            this.socketSessions.set(socketId, set);
+        }
+        set.add(sessionId);
+    }
+
+    /** Find the first session this socket belongs to (for input routing). */
+    private findSessionForSocket(socketId: string): string | undefined {
+        const set = this.socketSessions.get(socketId);
+        if (!set || set.size === 0) return undefined;
+        return set.values().next().value;
     }
 
     /**
@@ -527,6 +558,13 @@ export class CollaborativeTerminal {
         session.connectedSockets.delete(socketId);
         session.permissions.delete(socketId);
         session.socketIPs.delete(socketId);
+
+        // Remove from socketSessions tracking
+        const set = this.socketSessions.get(socketId);
+        if (set) {
+            set.delete(sessionId);
+            if (set.size === 0) this.socketSessions.delete(socketId);
+        }
 
         // If this socket held the auto-lock, release it
         const lock = this.lockMap.get(sessionId);

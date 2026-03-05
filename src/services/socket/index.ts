@@ -60,8 +60,7 @@ export const InitSocketConnection = async (server: HttpServer) => {
 
   io.on("connection", (socket) => {
     listner.onConnection(socket);
-    const sessionId = socket.handshake.query.sessionId as string;
-    if (sessionId) collab.register(socket, sessionId);
+    collab.registerAll(socket);
   });
  
   io.of("/dedicated-terminal").on("connection", (socket) => {

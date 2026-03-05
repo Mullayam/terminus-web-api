@@ -33,8 +33,10 @@
   @@COLLAB_CHECK_ROOM
   ─────────────────────────────────────────────────────────────────────────────
   When:     Before joining — check if the session exists and is joinable.
-  Payload:  (none)
+  Payload:  { sessionId: string }
   Response: Server emits @@COLLAB_ROOM_STATUS (see section 4)
+  Note:     Works even if you connected WITHOUT sessionId in the query string.
+            This listener is registered for EVERY socket on connect.
 
   @@COLLAB_JOIN_TERMINAL
   ─────────────────────────────────────────────────────────────────────────────
@@ -213,7 +215,7 @@
   JOINER (non-admin):
   ─────────────────────────────────────────────────────────────────────────────
   1.  Connect socket to "/"
-  2.  Emit  @@COLLAB_CHECK_ROOM  (no payload)
+  2.  Emit  @@COLLAB_CHECK_ROOM  { sessionId }
   3.  Listen for @@COLLAB_ROOM_STATUS:
         - exists=false → show "Session not found", stop
         - blocked=true → show "You're blocked", stop
