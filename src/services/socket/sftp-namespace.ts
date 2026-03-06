@@ -57,6 +57,7 @@ const E = SocketEventConstants;
 export class SFTPNamespace {
     private sftp!: SFTPClient;
     private sessionId: string;
+    private sftpSessionId: string;
     private currentPath = "/";
 
     constructor(
@@ -64,6 +65,7 @@ export class SFTPNamespace {
         private readonly redisClient: RedisClientType,
     ) {
         this.sessionId = (socket.handshake.query.sessionId as string) ?? "";
+        this.sftpSessionId = (socket.handshake.query.sftpSessionId as string) || this.sessionId;
 
         if (!this.sessionId) {
             Logging.dev(`[SFTP:ns] WARNING: no sessionId in handshake for ${socket.id}`);
@@ -107,11 +109,11 @@ export class SFTPNamespace {
                     config = parseSSHConfig(raw);
                 }
 
-                const client = await Sftp_Service.connectSFTP(config, this.sessionId,socket);
+                const client = await Sftp_Service.connectSFTP(config, this.sftpSessionId, socket);
                 this.sftp = client;
 
                 // Bind lifecycle events for this session
-                Sftp_Service.emitSftpEvent(this.sessionId, socket);
+                Sftp_Service.emitSftpEvent(this.sftpSessionId, socket);
 
                 socket.emit(E.SFTP_READY, true);
 
@@ -374,12 +376,12 @@ export class SFTPNamespace {
         socket.on("disconnect", async () => {
             Logging.dev(`[SFTP:ns] Client disconnected: ${socket.id}`);
 
-            if (!this.sessionId || !this.sftp) {
+            if (!this.sftpSessionId || !this.sftp) {
                 return;
             }
 
-            await Sftp_Service.disconnect(this.sessionId);
-            Logging.dev(`[SFTP:ns] SFTP torn down for ${this.sessionId}`);
+            await Sftp_Service.disconnect(this.sftpSessionId);
+            Logging.dev(`[SFTP:ns] SFTP torn down for ${this.sftpSessionId}`);
         });
     }
 
