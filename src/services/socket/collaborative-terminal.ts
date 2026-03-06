@@ -21,7 +21,7 @@ import type {
 const E = SocketEventConstants;
 
 const AUTO_LOCK_TTL = 4_000; // ms
-const ADMIN_RECONNECT_GRACE = 30_000; // ms — grace period before destroying session on admin disconnect
+const ADMIN_RECONNECT_GRACE = 15_000; // ms — grace period before destroying session on admin disconnect
 
 /**
  * Collaborative terminal handler.
@@ -150,6 +150,12 @@ export class CollaborativeTerminal {
 
         // Unbind old stream — caller will rebind via bindStream()
         this.streams.delete(sessionId);
+
+        // Notify collaborators that the admin is back
+        this.io.to(this.room(sessionId)).emit(E.COLLAB_ADMIN_RECONNECTED, {
+            sessionId,
+            message: "The admin has reconnected. You're back in the session.",
+        });
 
         Logging.dev(`♻️ Collab admin reconnected: ${sessionId} (${oldAdminId} → ${newSocketId})`);
     }
@@ -557,6 +563,13 @@ export class CollaborativeTerminal {
                 this.removeSocket(sessionId, socket.id);
 
                 if (isAdmin) {
+                    // Notify collaborators immediately that the admin has disconnected
+                    this.io.to(this.room(sessionId)).emit(E.COLLAB_ADMIN_DISCONNECTED, {
+                        sessionId,
+                        message: "The admin has disconnected. Please wait — if they reconnect, we'll reconnect you automatically.",
+                        gracePeriod: ADMIN_RECONNECT_GRACE,
+                    });
+
                     // Don't destroy immediately — admin may be refreshing the page.
                     // Start a grace period; if they reconnect in time the session survives.
                     this.reconnecting.add(sessionId);
@@ -567,8 +580,9 @@ export class CollaborativeTerminal {
                         const stillExists = this.sessionMap.get(sessionId);
                         if (stillExists) {
                             this.io.to(this.room(sessionId)).emit(E.COLLAB_SESSION_ENDED, {
+                                sessionId,
                                 reason: "admin-disconnected",
-                                message: "Session ended — the admin has disconnected.",
+                                message: "Session ended — the admin did not reconnect in time.",
                             });
                             this.destroySession(sessionId);
                         }
