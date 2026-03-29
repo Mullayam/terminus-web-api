@@ -44,10 +44,10 @@ class AppServer {
         AppServer.App.use(morgan("dev"));
         AppServer.App.use(cookieParser());
         AppServer.App.use(cors({
-            origin: __CONFIG__.FRONTEND_URL || "*",
+            origin: __CONFIG__.FRONTEND_URL,
             optionsSuccessStatus: 200,
-            methods: ["GET", "POST", "PUT", "DELETE"],
-            allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization", "Sessionid"],
+            methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+            allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization", "Sessionid", "x-app-version", "x-app-name", "x-api-key", "Cache-Control"],
             credentials: true
         }));
         AppServer.App.use(express.json());
