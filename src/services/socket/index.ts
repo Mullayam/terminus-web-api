@@ -16,10 +16,17 @@ let socketIo: Server<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, any>;
 
 export const InitSocketConnection = async (server: HttpServer) => {
   Logging.dev("Socket are Initialized");
+  const allowedOrigins = __CONFIG__.FRONTEND_URL;
   const io = new Server(server, {
     connectTimeout: 3000,
     cors: {
-      origin: "*",
+      origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean | string) => void) => {
+        if (!origin || allowedOrigins.includes(origin)) {
+          callback(null, origin || true);
+        } else {
+          callback(null, false);
+        }
+      },
     },
   });
   let pubClient = createClient({ url: __CONFIG__.REDIS_URL });

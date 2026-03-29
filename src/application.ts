@@ -43,8 +43,15 @@ class AppServer {
         AppServer.App.disable('x-powered-by');
         AppServer.App.use(morgan("dev"));
         AppServer.App.use(cookieParser());
+        const allowedOrigins = __CONFIG__.FRONTEND_URL;
         AppServer.App.use(cors({
-            origin: __CONFIG__.FRONTEND_URL,
+            origin: (origin, callback) => {
+                if (!origin || allowedOrigins.includes(origin)) {
+                    callback(null, origin || true);
+                } else {
+                    callback(null, false);
+                }
+            },
             optionsSuccessStatus: 200,
             methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
             allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization", "Sessionid", "x-app-version", "x-app-name", "x-api-key", "Cache-Control"],
