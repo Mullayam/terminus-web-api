@@ -26,6 +26,7 @@ router.post("/upload", SFTP.default.handleUpload);
 router.post("/download", SFTP.default.handleDownload);
 router.post("/file/read", SFTP.default.handleFileRead);
 router.post("/file/write", SFTP.default.handleFileWrite);
+router.post("/files", SFTP.default.handleLoadFilesAndDir);
 
 // AI
 router.get("/ai/providers", AiController.default.providers); 

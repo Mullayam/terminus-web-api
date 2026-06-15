@@ -299,6 +299,13 @@ class SFTPController {
                     signal: signal,
                 });
 
+                res.setHeader("Content-Type", "application/octet-stream");
+                res.setHeader(
+                    "Content-Disposition",
+                    `attachment; filename="${body.name}"`,
+                );
+                res.setHeader("Content-Length", totalSize);
+
                 const str = progress({
                     length: totalSize,
                     time: 1000, // emit progress every 1 second
@@ -482,6 +489,56 @@ class SFTPController {
                 res.json({ status: false, message: err.message, result: null });
             }
 
+        }
+    }
+
+    async handleLoadFilesAndDir(req: Request, res: Response) {
+        try {
+            const body = req.body as {
+                path: string;
+                sessionId: string;
+                sftpSessionId?: string;
+            };
+            const sftp = getSftp(req);
+            const dirPath = body.path || await sftp.cwd() as string;
+
+            const IGNORED_NAMES = new Set([
+                "node_modules", ".git", ".hg", ".svn",
+                "__pycache__", ".cache", ".npm", ".yarn",
+                "bower_components", ".venv", "venv", "env",
+                ".env", "dist", "build", ".next", ".nuxt",
+                ".turbo", ".parcel-cache", ".idea", ".vscode",
+                "vendor", "coverage", ".tox", ".gradle",
+                ".cargo", "target", ".DS_Store", "Thumbs.db",
+                ".sass-cache", ".output", ".docusaurus",
+            ]);
+
+            const entries = await sftp.list(dirPath);
+
+            const filtered = entries
+                .filter((entry) => !IGNORED_NAMES.has(entry.name))
+                .map((entry) => ({
+                    name: entry.name,
+                    type: entry.type,
+                    size: entry.size,
+                    modifyTime: entry.modifyTime,
+                    accessTime: entry.accessTime,
+                    rights: entry.rights,
+                    owner: entry.owner,
+                    group: entry.group,
+                    path: posix.join(dirPath, entry.name),
+                }));
+
+            res.json({
+                status: true,
+                message: "Files loaded successfully",
+                result: {
+                    currentDir: dirPath,
+                    files: filtered,
+                },
+            });
+        } catch (err: any) {
+            res.status(500).json({ status: false, message: err.message || "Error loading files", result: null });
         }
     }
 }

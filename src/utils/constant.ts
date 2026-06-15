@@ -4,6 +4,8 @@ const config = {
     JWT_SECRET: String(process.env.JWT_SECRET),
     REDIS_URL: String(process.env.REDIS_URL),
     ENCRYPTION_KEY: String(process.env.ENCRYPTION_KEY),
-    FRONTEND_URL: String(process.env.FRONTEND_URL),
+    FRONTEND_URL: process.env.FRONTEND_URL
+        ? process.env.FRONTEND_URL.split(',').map(u => u.trim()).filter(Boolean)
+        : ["*"],
 }
 export const __CONFIG__ = Object.freeze(config);

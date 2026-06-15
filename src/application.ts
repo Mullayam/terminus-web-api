@@ -55,6 +55,7 @@ class AppServer {
             optionsSuccessStatus: 200,
             methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
             allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization", "Sessionid", "x-app-version", "x-app-name", "x-api-key", "Cache-Control"],
+            exposedHeaders: ["Content-Disposition"],
             credentials: true
         }));
         AppServer.App.use(express.json());
