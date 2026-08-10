@@ -195,6 +195,41 @@ async function walkLocalDir(
 }
 
 /**
+ * Parallel-chunk SFTP upload options. `fastPut` issues up to `concurrency`
+ * in-flight WRITE requests, so throughput is bound by bandwidth rather than
+ * round-trip latency. Piping a stream into `put` sends one WRITE at a time and
+ * crawls at KB/s on any non-trivial-latency link. The window (concurrency ×
+ * chunkSize ≈ 32 MB) is sized so it never throttles the link; ssh2 auto-clamps
+ * the chunk to the server-negotiated max write size. Cost: ~32 MB buffer per
+ * active upload.
+ */
+const FASTPUT_CONCURRENCY = 512;
+const FASTPUT_CHUNK_SIZE = 65536;
+
+/**
+ * Upload a single local file over SFTP with parallel chunks, reporting
+ * throttled progress via `onProgress(transferred, total)`.
+ */
+async function putLocalFile(
+    sftp: SFTPClient,
+    localPath: string,
+    remotePath: string,
+    onProgress: (transferred: number, total: number) => void,
+): Promise<void> {
+    let lastEmit = 0;
+    await sftp.fastPut(localPath, remotePath, {
+        concurrency: FASTPUT_CONCURRENCY,
+        chunkSize: FASTPUT_CHUNK_SIZE,
+        step: (transferred, _chunk, total) => {
+            const now = Date.now();
+            if (transferred < total && now - lastEmit < 300) return;
+            lastEmit = now;
+            onProgress(transferred, total);
+        },
+    });
+}
+
+/**
  * Upload a set of local files to `remoteBase`, recreating their directory
  * structure remotely and emitting aggregate progress under `label`.
  */
@@ -221,9 +256,8 @@ async function uploadFileTree(
             createdDirs.add(remoteDir);
         }
 
-        const ps = progress({ length: item.size, time: 500 });
-        ps.on("progress", (p) => {
-            const transferred = uploaded + p.transferred;
+        await putLocalFile(sftp, item.localPath, remotePath, (chunkTransferred) => {
+            const transferred = uploaded + chunkTransferred;
             const elapsed = (Date.now() - start) / 1000;
             const speed = elapsed > 0 ? transferred / elapsed : 0;
             emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
@@ -238,8 +272,6 @@ async function uploadFileTree(
                 status: "uploading",
             });
         });
-
-        await sftp.put(createReadStream(item.localPath).pipe(ps), remotePath);
         uploaded += item.size;
     }
 
@@ -383,56 +415,46 @@ class SFTPController {
 
             const file = items[0].file;
             const remotePath = posix.join(path, file.name);
+            const start = Date.now();
 
-            const progressStream = progress({
-                length: file.size,
-                time: 500,
-            });
-
-            const readStream = createReadStream(file.tempFilePath);
-            const streamWithProgress = readStream.pipe(progressStream);
-
-            // Abort handling
+            // Abort handling: fastPut can't be interrupted mid-transfer, so
+            // this only notifies the client if a cancel arrives around it.
             signal.addEventListener("abort", () => {
-                readStream.destroy();
                 emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
                     name: file.name,
-                    percent: progressStream.progress().percentage.toFixed(2) || 100,
-                    transferred: progressStream.progress().transferred || 0,
-                    remaining: utils.convertBytes(
-                        progressStream.progress().remaining || file.size || 0,
-                    ),
+                    percent: "0.00",
+                    transferred: 0,
+                    remaining: utils.convertBytes(file.size || 0),
                     totalSize: file.size,
                     eta: 0,
-                    speed: utils.convertSpeed(progressStream.progress().speed || 0),
+                    speed: utils.convertSpeed(0),
                     status: "error",
                 });
-                res.status(499).end("Upload aborted by client");
+                if (!res.headersSent) res.status(499).end("Upload aborted by client");
             });
 
-            progressStream.on("progress", (progress) => {
+            await putLocalFile(sftp, file.tempFilePath, remotePath, (transferred, total) => {
+                const elapsed = (Date.now() - start) / 1000;
+                const speed = elapsed > 0 ? transferred / elapsed : 0;
                 emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
-                    percent: progress.percentage.toFixed(2),
-                    transferred: progress.transferred || 0,
-                    totalSize: file.size,
-                    remaining: utils.convertBytes(progress.remaining || file.size || 0),
-                    eta: progress.eta,
-                    speed: utils.convertSpeed(progress.speed),
+                    percent: total ? ((transferred / total) * 100).toFixed(2) : "100.00",
+                    transferred,
+                    totalSize: total,
+                    remaining: utils.convertBytes(Math.max(total - transferred, 0)),
+                    eta: speed > 0 ? Math.round((total - transferred) / speed) : 0,
+                    speed: utils.convertSpeed(speed),
                     status: "uploading",
                     name: file.name,
                 });
             });
 
-            await getSftp(req).put(streamWithProgress, remotePath);
             emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
                 percent: 100,
-                transferred: progressStream.progress().transferred || 0,
+                transferred: file.size,
                 totalSize: file.size,
-                remaining: utils.convertBytes(
-                    progressStream.progress().remaining || file.size || 0,
-                ),
+                remaining: utils.convertBytes(0),
                 eta: 0,
-                speed: utils.convertSpeed(progressStream.progress().speed || 0),
+                speed: utils.convertSpeed(0),
                 status: "completed",
                 name: file.name,
             });
@@ -444,14 +466,26 @@ class SFTPController {
                 result: remotePath,
             });
         } catch (err: any) {
-            console.error("Upload Error:", err);
-            if (!res.headersSent) {
-                res.status(500).json({
-                    status: false,
-                    message: "Something went wrong",
-                    result: null,
-                    error: err.message,
-                });
+            // A client-triggered cancel isn't an error — respond gracefully.
+            if (signal.aborted) {
+                if (!res.headersSent) {
+                    res.status(200).json({
+                        status: false,
+                        message: "Upload cancelled",
+                        result: null,
+                        cancelled: true,
+                    });
+                }
+            } else {
+                console.error("Upload Error:", err);
+                if (!res.headersSent) {
+                    res.status(500).json({
+                        status: false,
+                        message: "Something went wrong",
+                        result: null,
+                        error: err.message,
+                    });
+                }
             }
         } finally {
             ABORT_CONTROLLER_MAP.delete(cancelKey);

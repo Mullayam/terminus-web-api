@@ -269,7 +269,8 @@ export class SFTPNamespace {
             try {
                 const { path } = payload;
                 if (!path) return socket.emit(E.ERROR, "Invalid path");
-                await this.getSftp().rmdir(path);
+                // recursive=true so non-empty directories are removed (SFTP RMDIR only removes empty dirs)
+                await this.getSftp().rmdir(path, true);
                 socket.emit(E.SUCCESS, "Deleted successfully");
             } catch (err: any) {
                 socket.emit(E.ERROR, "Error deleting directory: " + err.message);
