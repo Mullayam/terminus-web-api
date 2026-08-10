@@ -1,14 +1,25 @@
-import { basename, join, posix } from "path";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "path";
 import type { Response, Request } from "express";
 import { UploadedFile as ExpressUploadedFile } from "express-fileupload";
 import { Sftp_Service } from "@services/sftp";
 import { getSocketIo } from "@/services/socket";
 import { SocketEventConstants } from "@/services/socket/events";
-import { createReadStream, existsSync, mkdirSync, rm } from "fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, promises as fsp } from "fs";
+import { pipeline } from "stream/promises";
+import { createGunzip } from "zlib";
+import os from "os";
+import AdmZip from "adm-zip";
+import * as tar from "tar";
 import archiver from "archiver";
 import progress from "progress-stream";
 import utils from "@/utils";
 import type SFTPClient from "ssh2-sftp-client";
+import type { Socket } from "socket.io";
+
+/** Emit to the panel's own /sftp socket when available, else broadcast. */
+type Emit = (event: string, payload: unknown) => void;
+const makeEmit = (socket?: Socket): Emit =>
+    (event, payload) => (socket ? socket.emit(event, payload) : getSocketIo().emit(event, payload));
 
 
 /**
@@ -63,6 +74,187 @@ async function walkRemoteDir(
     }
     return results;
 }
+
+/** Supported server-side extractable archives. */
+const ARCHIVE_RE = /\.(zip|tar\.gz|tgz|gz)$/i;
+const isArchive = (name: string) => ARCHIVE_RE.test(name);
+
+/** Normalise a client-supplied relative path and strip any traversal. */
+function sanitizeRelativePath(input: string): string {
+    const segments = input
+        .replace(/\\/g, "/")
+        .split("/")
+        .filter((s) => s && s !== "." && s !== "..");
+    return segments.join("/") || "file";
+}
+
+/** True when `child` resolves to a location inside `parent` (blocks zip-slip). */
+function isPathInside(parent: string, child: string): boolean {
+    const rel = relative(resolve(parent), resolve(child));
+    return !!rel && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+/**
+ * Collect uploaded files into a flat list, pairing each with its relative
+ * path. Folder uploads send a `paths` JSON array (same order as the files);
+ * loose uploads fall back to the file name.
+ */
+function collectUploadFiles(
+    req: Request,
+): { file: ExpressUploadedFile; relativePath: string }[] {
+    const files: ExpressUploadedFile[] = [];
+    for (const key of Object.keys(req.files ?? {})) {
+        const val = (req.files as Record<string, ExpressUploadedFile | ExpressUploadedFile[]>)[key];
+        if (Array.isArray(val)) files.push(...val);
+        else files.push(val);
+    }
+
+    let paths: string[] = [];
+    const rawPaths = req.body?.paths;
+    if (rawPaths) {
+        try {
+            const parsed = typeof rawPaths === "string" ? JSON.parse(rawPaths) : rawPaths;
+            if (Array.isArray(parsed)) paths = parsed.map((p) => String(p));
+        } catch {
+            paths = [];
+        }
+    }
+
+    return files.map((file, i) => ({
+        file,
+        relativePath: sanitizeRelativePath(paths[i] ?? file.name),
+    }));
+}
+
+/**
+ * Extract a supported archive (`.zip`, `.tar.gz`, `.tgz`, `.gz`) into
+ * `destDir`, guarding against path-traversal (zip-slip) entries.
+ */
+async function extractArchive(file: ExpressUploadedFile, destDir: string): Promise<void> {
+    const name = file.name.toLowerCase();
+    await fsp.mkdir(destDir, { recursive: true });
+
+    if (name.endsWith(".zip")) {
+        const zip = new AdmZip(file.tempFilePath);
+        for (const entry of zip.getEntries()) {
+            const target = join(destDir, entry.entryName);
+            if (!isPathInside(destDir, target)) {
+                throw new Error(`Unsafe path in archive: ${entry.entryName}`);
+            }
+            if (entry.isDirectory) {
+                await fsp.mkdir(target, { recursive: true });
+            } else {
+                await fsp.mkdir(dirname(target), { recursive: true });
+                await fsp.writeFile(target, entry.getData());
+            }
+        }
+        return;
+    }
+
+    if (name.endsWith(".tar.gz") || name.endsWith(".tgz")) {
+        // `tar` strips absolute paths and `..` entries by default.
+        await tar.x({ file: file.tempFilePath, cwd: destDir });
+        return;
+    }
+
+    if (name.endsWith(".gz")) {
+        // Plain single-file gzip → strip the `.gz` suffix.
+        const outName = basename(file.name).replace(/\.gz$/i, "") || "file";
+        await pipeline(
+            createReadStream(file.tempFilePath),
+            createGunzip(),
+            createWriteStream(join(destDir, outName)),
+        );
+        return;
+    }
+
+    throw new Error(`Unsupported archive type: ${file.name}`);
+}
+
+/** Recursively list files under `dir`, with paths relative to `baseDir`. */
+async function walkLocalDir(
+    dir: string,
+    baseDir: string,
+): Promise<{ localPath: string; relativePath: string; size: number }[]> {
+    const out: { localPath: string; relativePath: string; size: number }[] = [];
+    const entries = await fsp.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+            out.push(...(await walkLocalDir(full, baseDir)));
+        } else if (entry.isFile()) {
+            const st = await fsp.stat(full);
+            out.push({
+                localPath: full,
+                relativePath: relative(baseDir, full).replace(/\\/g, "/"),
+                size: st.size,
+            });
+        }
+    }
+    return out;
+}
+
+/**
+ * Upload a set of local files to `remoteBase`, recreating their directory
+ * structure remotely and emitting aggregate progress under `label`.
+ */
+async function uploadFileTree(
+    sftp: SFTPClient,
+    items: { localPath: string; relativePath: string; size: number }[],
+    remoteBase: string,
+    label: string,
+    signal: AbortSignal,
+    emit: Emit,
+): Promise<void> {
+    const totalSize = items.reduce((s, f) => s + f.size, 0);
+    const start = Date.now();
+    const createdDirs = new Set<string>();
+    let uploaded = 0;
+
+    for (const item of items) {
+        if (signal.aborted) throw new Error("Upload aborted by client");
+
+        const remotePath = posix.join(remoteBase, item.relativePath);
+        const remoteDir = posix.dirname(remotePath);
+        if (remoteDir && !createdDirs.has(remoteDir)) {
+            await sftp.mkdir(remoteDir, true).catch(() => { });
+            createdDirs.add(remoteDir);
+        }
+
+        const ps = progress({ length: item.size, time: 500 });
+        ps.on("progress", (p) => {
+            const transferred = uploaded + p.transferred;
+            const elapsed = (Date.now() - start) / 1000;
+            const speed = elapsed > 0 ? transferred / elapsed : 0;
+            emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
+                name: label,
+                file: item.relativePath,
+                percent: totalSize ? ((transferred / totalSize) * 100).toFixed(2) : "100.00",
+                transferred,
+                totalSize,
+                remaining: utils.convertBytes(Math.max(totalSize - transferred, 0)),
+                eta: speed > 0 ? Math.round((totalSize - transferred) / speed) : 0,
+                speed: utils.convertSpeed(speed),
+                status: "uploading",
+            });
+        });
+
+        await sftp.put(createReadStream(item.localPath).pipe(ps), remotePath);
+        uploaded += item.size;
+    }
+
+    emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
+        name: label,
+        percent: "100.00",
+        transferred: totalSize,
+        totalSize,
+        remaining: utils.convertBytes(0),
+        eta: 0,
+        speed: utils.convertSpeed(0),
+        status: "completed",
+    });
+}
+
 class SFTPController {
     constructor() {
         if (!existsSync(uploadPath)) {
@@ -113,69 +305,84 @@ class SFTPController {
     async handleUpload(req: Request, res: Response) {
         const abortController = new AbortController();
         const uploadId = Date.now().toString();
-        ABORT_CONTROLLER_MAP.set(uploadId, abortController);
         const signal = abortController.signal;
 
-        if (!req.files) {
-            res.status(400).send("No file uploaded");
+        if (!req.files || Object.keys(req.files).length === 0) {
+            res.status(400).json({ status: false, message: "No file uploaded", result: null });
             return;
         }
 
         const path = req.body.path;
-        const isMultiFile = Object.keys(req.files).length > 1;
+        if (!path) {
+            res.status(400).json({ status: false, message: "Destination path is required", result: null });
+            return;
+        }
+
+        const items = collectUploadFiles(req);
+        // Cancellable via CANCEL_UPLOADING using this name.
+        const cancelKey = (req.body.name as string) || items[0]?.file.name || uploadId;
+        ABORT_CONTROLLER_MAP.set(cancelKey, abortController);
+
+        // A single archive file → extract on the server, then upload contents.
+        const isSingleArchive = items.length === 1 && isArchive(items[0].file.name);
+        // A folder / multi-file upload where structure must be preserved.
+        const isStructured =
+            items.length > 1 || items.some((it) => it.relativePath.includes("/"));
 
         try {
-            if (isMultiFile) {
-                const dirPath = join(uploadPath);
+            const sftp = getSftp(req);
+            const socket = getSftpSocket(req);
+            const emit = makeEmit(socket);
 
-                if (!existsSync(dirPath)) {
-                    mkdirSync(dirPath, { recursive: true });
-                }
-
-                // Save all files temporarily
-                for (const key in req.files) {
-                    const file = req.files[key] as ExpressUploadedFile;
-                    await new Promise((resolve, reject) => {
-                        file.mv(`${dirPath}/${file.name}`, (err) => {
-                            if (err) return reject(err);
-                            resolve(null);
-                        });
-                    });
-                }
-
-                // Upload directory with filter
-                await getSftp(req).uploadDir(dirPath, path, {
-                    filter: (filePath: string) => {
-                        const name = basename(filePath);
-                        return (
-                            !filePath.includes(".git") &&
-                            !filePath.includes("node_modules") &&
-                            !name.startsWith(".")
-                        );
-                    },
+            // ── Archive upload → extract on server, preserving folders ──────
+            if (isSingleArchive) {
+                const file = items[0].file;
+                const tmpDir = join(os.tmpdir(), `sftp-extract-${uploadId}`);
+                emit(SocketEventConstants.EXTRACTING, {
+                    name: file.name,
+                    status: "extracting",
+                    percent: "0.00",
+                    transferred: 0,
+                    totalSize: file.size,
+                    remaining: utils.convertBytes(file.size),
+                    eta: 0,
+                    speed: utils.convertSpeed(0),
                 });
+                try {
+                    await extractArchive(file, tmpDir);
+                    const tree = await walkLocalDir(tmpDir, tmpDir);
+                    await uploadFileTree(sftp, tree, path, file.name, signal, emit);
+                    emit(SocketEventConstants.FILE_UPLOADED, path);
+                    res.json({
+                        status: true,
+                        message: "Archive extracted & uploaded successfully",
+                        result: path,
+                    });
+                } finally {
+                    await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => { });
+                }
+                return;
+            }
 
-                // Notify completion
-                getSocketIo().emit(SocketEventConstants.FILE_UPLOADED, path);
-
+            // ── Folder / multi-file upload (directory structure preserved) ──
+            if (isStructured) {
+                const tree = items.map((it) => ({
+                    localPath: it.file.tempFilePath,
+                    relativePath: it.relativePath,
+                    size: it.file.size,
+                }));
+                await uploadFileTree(sftp, tree, path, (req.body.name as string) || "folder", signal, emit);
+                emit(SocketEventConstants.FILE_UPLOADED, path);
                 res.json({
                     status: true,
                     message: "Files uploaded successfully",
                     result: path,
                 });
-
-                // Cleanup
-                rm(uploadPath, { recursive: true, force: true }, (err) => {
-                    if (err) {
-                        getSocketIo().emit(SocketEventConstants.ERROR, err.message);
-                    }
-                });
-
                 return;
             }
 
-            const file = req.files.file as ExpressUploadedFile;
-            const remotePath = `${path}/${file.name}`;
+            const file = items[0].file;
+            const remotePath = posix.join(path, file.name);
 
             const progressStream = progress({
                 length: file.size,
@@ -188,7 +395,7 @@ class SFTPController {
             // Abort handling
             signal.addEventListener("abort", () => {
                 readStream.destroy();
-                getSocketIo().emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
+                emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
                     name: file.name,
                     percent: progressStream.progress().percentage.toFixed(2) || 100,
                     transferred: progressStream.progress().transferred || 0,
@@ -204,7 +411,7 @@ class SFTPController {
             });
 
             progressStream.on("progress", (progress) => {
-                getSocketIo().emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
+                emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
                     percent: progress.percentage.toFixed(2),
                     transferred: progress.transferred || 0,
                     totalSize: file.size,
@@ -217,7 +424,7 @@ class SFTPController {
             });
 
             await getSftp(req).put(streamWithProgress, remotePath);
-            getSocketIo().emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
+            emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
                 percent: 100,
                 transferred: progressStream.progress().transferred || 0,
                 totalSize: file.size,
@@ -229,7 +436,7 @@ class SFTPController {
                 status: "completed",
                 name: file.name,
             });
-            getSocketIo().emit(SocketEventConstants.FILE_UPLOADED, remotePath);
+            emit(SocketEventConstants.FILE_UPLOADED, remotePath);
 
             res.json({
                 status: true,
@@ -238,12 +445,16 @@ class SFTPController {
             });
         } catch (err: any) {
             console.error("Upload Error:", err);
-            res.status(500).json({
-                status: false,
-                message: "Something went wrong",
-                result: null,
-                error: err.message,
-            });
+            if (!res.headersSent) {
+                res.status(500).json({
+                    status: false,
+                    message: "Something went wrong",
+                    result: null,
+                    error: err.message,
+                });
+            }
+        } finally {
+            ABORT_CONTROLLER_MAP.delete(cancelKey);
         }
     }
 
