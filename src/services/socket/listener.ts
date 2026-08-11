@@ -316,13 +316,46 @@ export class SocketListener extends EventEmitter {
      * Also called automatically when the shell is first opened.
      */
     private registerSilentExec(socket: Socket, sessionId: string) {
-        socket.on(E.SSH_EXEC_SILENT, (payload?: { command?: string }) => {
+        socket.on(E.SSH_EXEC_SILENT, (payload?: { command?: string; cmd?: string; requestId?: string }) => {
             const conn = this.sessions.get(sessionId);
             if (!conn) {
                 socket.emit(E.SSH_EMIT_ERROR, "No active SSH session");
                 return;
             }
+
+            // Filesystem autocomplete: arbitrary listing keyed by requestId → raw stdout
+            if (payload?.requestId && payload?.cmd) {
+                this.execSilentRaw(conn, socket, payload.requestId, payload.cmd);
+                return;
+            }
+
             this.execSilent(conn, socket, payload?.command);
+        });
+    }
+
+    /**
+     * Raw silent exec – runs an arbitrary command on a one-off exec channel and
+     * returns the untouched stdout keyed by `requestId`. Used by the client-side
+     * filesystem autocomplete (cd/ls/cat/…) which parses the raw listing itself.
+     * Never touches the interactive PTY; no-ops safely (empty output) on error.
+     */
+    private execSilentRaw(conn: Client, socket: Socket, requestId: string, cmd: string) {
+        conn.exec(cmd, (err, stream) => {
+            if (err) {
+                socket.emit(E.SSH_EXEC_SILENT_OUTPUT, { requestId, output: "" });
+                return;
+            }
+
+            let output = "";
+            stream.on("data", (chunk: Buffer) => {
+                output += chunk.toString("utf-8");
+            });
+            stream.stderr.on("data", () => {
+                /* ignore stderr – client only needs stdout listings */
+            });
+            stream.on("close", () => {
+                socket.emit(E.SSH_EXEC_SILENT_OUTPUT, { requestId, output });
+            });
         });
     }
 

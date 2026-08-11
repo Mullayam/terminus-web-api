@@ -1,8 +1,9 @@
 import SFTPClient from "ssh2-sftp-client";
 import { Socket } from "socket.io";
 import { RedisClientType } from "redis";
+import type { Client } from "ssh2";
 import fs from "fs";
-import { join } from "path";
+import { join, posix } from "path";
 import AdmZip from "adm-zip";
 import { Logging } from "@enjoys/express-utils/logger";
 import { SocketEventConstants } from "./events";
@@ -37,6 +38,8 @@ const E = SocketEventConstants;
  *   @@SFTP_FILE_STATS           { path }
  *   @@SFTP_FILE_DOWNLOAD        { path }
  *   @@SFTP_ZIP_EXTRACT          { dirPath }
+ *   @@SFTP_COMPRESS             { sources[], destination, format: "zip"|"tar.gz", cwd }
+ *   @@SFTP_EXTRACT              { archivePath, destination }
  *   @@SFTP_EDIT_FILE_REQUEST    { path }
  *   @@SFTP_EDIT_FILE_DONE       { path, content }
  *   @@SFTP_GET_DIR_TREE         { dirPath?, depth? }   (default depth = 2, each expand adds +2)
@@ -79,6 +82,49 @@ export class SFTPNamespace {
     private getSftp(): SFTPClient {
         if (!this.sftp) throw new Error("SFTP not connected");
         return this.sftp;
+    }
+
+    /** Allowed archive formats — never derive a command from raw input */
+    private static readonly ARCHIVE_FORMATS = new Set(["zip", "tar.gz"]);
+
+    /**
+     * POSIX single-quote escaping. Wrapping an argument in single quotes and
+     * escaping embedded single quotes (`'` → `'\''`) neutralizes spaces, `;`,
+     * `$()`, backticks, quotes, etc. so remote paths can't break out of the
+     * command (OWASP A03 — command injection).
+     */
+    private static shq(arg: string): string {
+        return `'${String(arg).replace(/'/g, `'\\''`)}'`;
+    }
+
+    /**
+     * Confine a remote path: must be a non-empty absolute path with no `..`
+     * segments (path-traversal guard). Returns the validated path.
+     */
+    private static assertSafePath(p: unknown, label: string): string {
+        if (typeof p !== "string" || !p.trim()) throw new Error(`${label} is required`);
+        if (!p.startsWith("/")) throw new Error(`${label} must be an absolute path`);
+        if (p.split("/").includes("..")) throw new Error(`${label} must not contain ".." segments`);
+        return p;
+    }
+
+    /** Run a command on the SFTP session's underlying SSH connection (non-interactive exec). */
+    private execRemote(command: string): Promise<{ code: number; stdout: string; stderr: string }> {
+        return new Promise((resolve, reject) => {
+            // ssh2-sftp-client holds the ssh2 Client on `.client` (absent from its @types)
+            const conn = (this.getSftp() as unknown as { client?: Client }).client;
+            if (!conn) return reject(new Error("SSH connection not available"));
+
+            conn.exec(command, (err, stream) => {
+                if (err) return reject(err);
+                let stdout = "";
+                let stderr = "";
+                stream.on("data", (d: Buffer) => { stdout += d.toString("utf-8"); });
+                stream.stderr.on("data", (d: Buffer) => { stderr += d.toString("utf-8"); });
+                stream.on("error", reject);
+                stream.on("close", (code: number) => resolve({ code: code ?? 0, stdout, stderr }));
+            });
+        });
     }
 
     /* ─── event registration ──────────────────────────────────────────── */
@@ -369,6 +415,124 @@ export class SFTPNamespace {
                 console.error(err);
             }
         });
+
+        // ── Compress → create an archive on the remote host ──────────────
+        socket.on(E.SFTP_COMPRESS, async (payload: {
+            sources?: string[];
+            destination?: string;
+            format?: string;
+            cwd?: string;
+        }): Promise<any> => {
+            const format = payload?.format ?? "";
+            const destName = payload?.destination ? posix.basename(payload.destination) : "archive";
+            try {
+                const { sources } = payload || {};
+                if (!Array.isArray(sources) || sources.length === 0) {
+                    return socket.emit(E.SFTP_EMIT_ERROR, "No sources provided to compress");
+                }
+                if (!SFTPNamespace.ARCHIVE_FORMATS.has(format)) {
+                    return socket.emit(
+                        E.SFTP_EMIT_ERROR,
+                        `Unsupported format — allowed: ${[...SFTPNamespace.ARCHIVE_FORMATS].join(", ")}`,
+                    );
+                }
+
+                const dest = SFTPNamespace.assertSafePath(payload.destination, "destination");
+                const base = SFTPNamespace.assertSafePath(payload.cwd, "cwd");
+
+                // Confine each source to `cwd` and compute the archive-relative entry name
+                const rel: string[] = [];
+                for (const s of sources) {
+                    SFTPNamespace.assertSafePath(s, "source");
+                    const r = posix.relative(base, s);
+                    if (!r || r.startsWith("..") || posix.isAbsolute(r)) {
+                        return socket.emit(E.SFTP_EMIT_ERROR, `Source is outside the base directory: ${s}`);
+                    }
+                    rel.push(r);
+                }
+
+                const sftp = this.getSftp();
+                for (const s of sources) {
+                    if (!(await sftp.exists(s))) {
+                        return socket.emit(E.SFTP_EMIT_ERROR, `Source does not exist: ${s}`);
+                    }
+                }
+
+                const Q = SFTPNamespace.shq;
+                let cmd: string;
+                if (format === "zip") {
+                    if ((await this.execRemote("command -v zip")).code !== 0) {
+                        return socket.emit(E.SFTP_EMIT_ERROR, "`zip` is not installed on the remote host");
+                    }
+                    cmd = `cd ${Q(base)} && zip -r -q ${Q(dest)} ${rel.map(Q).join(" ")}`;
+                } else {
+                    cmd = `tar -czf ${Q(dest)} -C ${Q(base)} ${rel.map(Q).join(" ")}`;
+                }
+
+                socket.emit(E.SFTP_ARCHIVE_PROGRESS, { op: "compress", name: destName, percent: 0, status: "running" });
+                const { code, stderr } = await this.execRemote(cmd);
+                if (code !== 0) {
+                    socket.emit(E.SFTP_ARCHIVE_PROGRESS, { op: "compress", name: destName, percent: 0, status: "error" });
+                    return socket.emit(E.SFTP_EMIT_ERROR, stderr.trim() || `Compression failed (exit ${code})`);
+                }
+
+                socket.emit(E.SFTP_ARCHIVE_PROGRESS, { op: "compress", name: destName, percent: 100, status: "completed" });
+                socket.emit(E.SUCCESS, `Archive created: ${posix.basename(dest)}`);
+            } catch (err: any) {
+                socket.emit(E.SFTP_ARCHIVE_PROGRESS, { op: "compress", name: destName, percent: 0, status: "error" });
+                socket.emit(E.SFTP_EMIT_ERROR, "Error creating archive: " + err.message);
+            }
+        });
+
+        // ── Extract → unpack an archive on the remote host ───────────────
+        socket.on(E.SFTP_EXTRACT, async (payload: {
+            archivePath?: string;
+            destination?: string;
+        }): Promise<any> => {
+            const arcName = payload?.archivePath ? posix.basename(payload.archivePath) : "archive";
+            try {
+                const archivePath = SFTPNamespace.assertSafePath(payload?.archivePath, "archivePath");
+                const destination = SFTPNamespace.assertSafePath(payload?.destination, "destination");
+
+                const sftp = this.getSftp();
+                if (!(await sftp.exists(archivePath))) {
+                    return socket.emit(E.SFTP_EMIT_ERROR, `Archive does not exist: ${archivePath}`);
+                }
+
+                // Detect format from the archive extension — one handler, both types
+                const lower = archivePath.toLowerCase();
+                const isZip = lower.endsWith(".zip");
+                const isTarGz = lower.endsWith(".tar.gz") || lower.endsWith(".tgz") || lower.endsWith(".gz");
+                if (!isZip && !isTarGz) {
+                    return socket.emit(E.SFTP_EMIT_ERROR, "Unsupported archive type (expected .zip, .tar.gz, .tgz or .gz)");
+                }
+
+                const Q = SFTPNamespace.shq;
+                let cmd: string;
+                if (isZip) {
+                    if ((await this.execRemote("command -v unzip")).code !== 0) {
+                        return socket.emit(E.SFTP_EMIT_ERROR, "`unzip` is not installed on the remote host");
+                    }
+                    cmd = `mkdir -p ${Q(destination)} && unzip -o ${Q(archivePath)} -d ${Q(destination)}`;
+                } else {
+                    cmd = `mkdir -p ${Q(destination)} && tar -xzf ${Q(archivePath)} -C ${Q(destination)}`;
+                }
+
+                socket.emit(E.SFTP_ARCHIVE_PROGRESS, { op: "extract", name: arcName, percent: 0, status: "running" });
+                const { code, stderr } = await this.execRemote(cmd);
+                if (code !== 0) {
+                    socket.emit(E.SFTP_ARCHIVE_PROGRESS, { op: "extract", name: arcName, percent: 0, status: "error" });
+                    return socket.emit(E.SFTP_EMIT_ERROR, stderr.trim() || `Extraction failed (exit ${code})`);
+                }
+
+                socket.emit(E.SFTP_ARCHIVE_PROGRESS, { op: "extract", name: arcName, percent: 100, status: "completed" });
+                socket.emit(E.SUCCESS, `Extracted to ${destination}`);
+            } catch (err: any) {
+                socket.emit(E.SFTP_ARCHIVE_PROGRESS, { op: "extract", name: arcName, percent: 0, status: "error" });
+                socket.emit(E.SFTP_EMIT_ERROR, "Error extracting archive: " + err.message);
+            }
+        });
+
         // ── Cancel upload / download ─────────────────────────────────────
         socket.on(E.CANCEL_UPLOADING, (name: string) => this.progressCancel(name));
         socket.on(E.CANCEL_DOWNLOADING, (name: string) => this.progressCancel(name));
