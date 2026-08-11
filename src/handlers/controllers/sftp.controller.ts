@@ -45,6 +45,14 @@ const getSftpSocket = (req: Request) => {
 const uploadPath = join(process.cwd(), "storage");
 export const ABORT_CONTROLLER_MAP = new Map<string, AbortController>();
 
+/** Staging dir for resumable chunk uploads (the client→server hop). */
+const RESUME_STAGING_DIR = join(os.tmpdir(), "sftp-resume");
+/** Restrict a client-supplied upload id to a safe, traversal-free filename. */
+const sanitizeUploadId = (id: string) =>
+    id.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 128);
+/** Serialize chunk writes per uploadId (chunks are sequential; guards races). */
+const RESUME_LOCKS = new Set<string>();
+
 const EXCLUDED_NAMES = [".git", "node_modules", "build", "dist"];
 
 /**
@@ -489,6 +497,197 @@ class SFTPController {
             }
         } finally {
             ABORT_CONTROLLER_MAP.delete(cancelKey);
+        }
+    }
+
+    /**
+     * Resumable-upload probe. Returns how many bytes of `uploadId` are already
+     * staged on the server so the client can resume by sending only the bytes
+     * from `offset` onward. Returns `offset: 0` when nothing is staged yet.
+     */
+    async handleUploadStatus(req: Request, res: Response) {
+        try {
+            const uploadId = sanitizeUploadId(
+                String(req.body?.uploadId ?? req.query?.uploadId ?? ""),
+            );
+            if (!uploadId) {
+                res.status(400).json({ status: false, message: "uploadId is required", result: null });
+                return;
+            }
+            const stagingPath = join(RESUME_STAGING_DIR, uploadId);
+            let offset = 0;
+            try { offset = (await fsp.stat(stagingPath)).size; } catch { offset = 0; }
+            res.json({ status: true, message: "ok", result: { uploadId, offset } });
+        } catch (err: any) {
+            res.status(500).json({ status: false, message: err.message || "Error", result: null });
+        }
+    }
+
+    /**
+     * Append one resumable chunk to a local staging file, then push the
+     * completed file to the remote at full speed once all bytes have arrived.
+     * The client sends the `chunk` field starting at `offset` (see
+     * handleUploadStatus) plus `path`, `name`, `offset` and `total`.
+     */
+    async handleUploadChunk(req: Request, res: Response) {
+        const uploadId = sanitizeUploadId(String(req.body?.uploadId ?? ""));
+        if (!uploadId) {
+            res.status(400).json({ status: false, message: "uploadId is required", result: null });
+            return;
+        }
+        const path = req.body?.path as string;
+        const name = req.body?.name ? basename(String(req.body.name)) : undefined;
+        const offset = Number(req.body?.offset);
+        const total = Number(req.body?.total);
+        if (!path || !name || !Number.isFinite(offset) || offset < 0 || !Number.isFinite(total) || total <= 0) {
+            res.status(400).json({ status: false, message: "path, name, offset and total are required", result: null });
+            return;
+        }
+        const chunk = (req.files as Record<string, ExpressUploadedFile | ExpressUploadedFile[]> | undefined)?.chunk;
+        const chunkFile = Array.isArray(chunk) ? chunk[0] : chunk;
+        if (!chunkFile) {
+            res.status(400).json({ status: false, message: "No chunk uploaded", result: null });
+            return;
+        }
+        if (offset + chunkFile.size > total) {
+            await fsp.rm(chunkFile.tempFilePath, { force: true }).catch(() => { });
+            res.status(400).json({ status: false, message: "Chunk exceeds declared total size", result: null });
+            return;
+        }
+
+        // Chunks for one upload must not run concurrently or they'd interleave.
+        if (RESUME_LOCKS.has(uploadId)) {
+            await fsp.rm(chunkFile.tempFilePath, { force: true }).catch(() => { });
+            res.status(409).json({ status: false, message: "Chunk already in progress for this uploadId", result: null });
+            return;
+        }
+        RESUME_LOCKS.add(uploadId);
+
+        const stagingPath = join(RESUME_STAGING_DIR, uploadId);
+        try {
+            await fsp.mkdir(RESUME_STAGING_DIR, { recursive: true });
+
+            // Offset guard: staged size must equal the client's claimed offset,
+            // else chunks would overlap or leave a gap. Report the real offset.
+            let staged = 0;
+            try { staged = (await fsp.stat(stagingPath)).size; } catch { staged = 0; }
+            if (staged !== offset) {
+                res.status(409).json({
+                    status: false,
+                    message: "Offset mismatch",
+                    result: { uploadId, offset: staged },
+                });
+                return;
+            }
+
+            await pipeline(
+                createReadStream(chunkFile.tempFilePath),
+                createWriteStream(stagingPath, { flags: "a" }),
+            );
+            const newSize = (await fsp.stat(stagingPath)).size;
+
+            const socket = getSftpSocket(req);
+            const emit = makeEmit(socket);
+
+            // More bytes still expected → ack this chunk and wait for the next.
+            if (newSize < total) {
+                emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
+                    name,
+                    percent: ((newSize / total) * 100).toFixed(2),
+                    transferred: newSize,
+                    totalSize: total,
+                    remaining: utils.convertBytes(Math.max(total - newSize, 0)),
+                    eta: 0,
+                    speed: utils.convertSpeed(0),
+                    status: "uploading",
+                    phase: "staging",
+                });
+                res.json({
+                    status: true,
+                    message: "Chunk received",
+                    result: { uploadId, offset: newSize, completed: false },
+                });
+                return;
+            }
+
+            // All bytes staged → transfer the complete file to the remote.
+            const sftp = getSftp(req);
+            const remotePath = posix.join(path, name);
+            const remoteDir = posix.dirname(remotePath);
+            if (remoteDir) await sftp.mkdir(remoteDir, true).catch(() => { });
+
+            const start = Date.now();
+            await putLocalFile(sftp, stagingPath, remotePath, (transferred, t) => {
+                const elapsed = (Date.now() - start) / 1000;
+                const speed = elapsed > 0 ? transferred / elapsed : 0;
+                emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
+                    name,
+                    percent: t ? ((transferred / t) * 100).toFixed(2) : "100.00",
+                    transferred,
+                    totalSize: t,
+                    remaining: utils.convertBytes(Math.max(t - transferred, 0)),
+                    eta: speed > 0 ? Math.round((t - transferred) / speed) : 0,
+                    speed: utils.convertSpeed(speed),
+                    status: "uploading",
+                    phase: "transfer",
+                });
+            });
+
+            emit(SocketEventConstants.FILE_UPLOADED_PROGRESS, {
+                name,
+                percent: 100,
+                transferred: total,
+                totalSize: total,
+                remaining: utils.convertBytes(0),
+                eta: 0,
+                speed: utils.convertSpeed(0),
+                status: "completed",
+                phase: "transfer",
+            });
+            emit(SocketEventConstants.FILE_UPLOADED, remotePath);
+
+            await fsp.rm(stagingPath, { force: true }).catch(() => { });
+            res.json({
+                status: true,
+                message: "File uploaded successfully",
+                result: { uploadId, offset: total, completed: true, remotePath },
+            });
+        } catch (err: any) {
+            console.error("Chunk Upload Error:", err);
+            if (!res.headersSent) {
+                res.status(500).json({ status: false, message: err.message || "Something went wrong", result: null });
+            }
+        } finally {
+            RESUME_LOCKS.delete(uploadId);
+            // express-fileupload keeps the temp file on success; drop this
+            // chunk's temp file so the temp dir doesn't fill up.
+            await fsp.rm(chunkFile.tempFilePath, { force: true }).catch(() => { });
+        }
+    }
+
+    /**
+     * Discard a resumable upload's staged bytes so a later attempt starts
+     * fresh. Refuses while a chunk is mid-write (client should stop sending
+     * chunks first). The remote file, if already transferred, is left intact.
+     */
+    async handleUploadAbort(req: Request, res: Response) {
+        try {
+            const uploadId = sanitizeUploadId(
+                String(req.body?.uploadId ?? req.query?.uploadId ?? ""),
+            );
+            if (!uploadId) {
+                res.status(400).json({ status: false, message: "uploadId is required", result: null });
+                return;
+            }
+            if (RESUME_LOCKS.has(uploadId)) {
+                res.status(409).json({ status: false, message: "Chunk in progress, retry abort", result: { uploadId } });
+                return;
+            }
+            const stagingPath = join(RESUME_STAGING_DIR, uploadId);
+            await fsp.rm(stagingPath, { force: true }).catch(() => { });
+            res.json({ status: true, message: "Upload aborted", result: { uploadId } });
+        } catch (err: any) {
+            res.status(500).json({ status: false, message: err.message || "Error", result: null });
         }
     }
 

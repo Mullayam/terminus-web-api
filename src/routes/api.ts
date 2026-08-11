@@ -23,6 +23,9 @@ router.delete("/sessions/:id", TerminalSession.default.deleteSession);
 
 // SFTP Operations
 router.post("/upload", SFTP.default.handleUpload);
+router.post("/upload/status", SFTP.default.handleUploadStatus);
+router.post("/upload/chunk", SFTP.default.handleUploadChunk);
+router.post("/upload/abort", SFTP.default.handleUploadAbort);
 router.post("/download", SFTP.default.handleDownload);
 router.post("/file/read", SFTP.default.handleFileRead);
 router.post("/file/write", SFTP.default.handleFileWrite);
