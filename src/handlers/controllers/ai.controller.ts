@@ -660,7 +660,8 @@ class AiController {
         return;
       }
 
-      const streamOptions = modelOptions(body.providerId, body.modelId);
+      // Streaming variant of /complete, so it gets the same inline restrictions.
+      const streamOptions = inlineModelOptions(body.providerId, body.modelId);
 
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
@@ -689,10 +690,11 @@ class AiController {
     } catch (err: any) {
       const message =
         err instanceof Error ? err.message : "AI streaming failed.";
-      try {
+      // Writing before flushHeaders would implicitly commit a 200, hiding a 400.
+      if (res.headersSent) {
         res.write(`event: error\ndata: ${JSON.stringify({ message })}\n\n`);
         res.end();
-      } catch {
+      } else {
         res.status(errorStatus(err)).json({ success: false, message });
       }
     }
@@ -814,10 +816,14 @@ class AiController {
       res.write(`event: done\ndata: ${JSON.stringify({ text: final.text })}\n\n`);
       res.end();
     } catch (err: any) {
-      res.status(errorStatus(err)).json({
-        success: false,
-        message: err instanceof Error ? err.message : "Failed.",
-      });
+      const message = err instanceof Error ? err.message : "Failed.";
+      // Once the SSE stream is open, a JSON status would throw ERR_HTTP_HEADERS_SENT.
+      if (res.headersSent) {
+        res.write(`event: error\ndata: ${JSON.stringify({ message })}\n\n`);
+        res.end();
+      } else {
+        res.status(errorStatus(err)).json({ success: false, message });
+      }
     }
   }
 
@@ -912,10 +918,11 @@ You don't need to read a file if it's already provided in context.
       res.end();
     } catch (err: any) {
       const message = err instanceof Error ? err.message : "Chat failed.";
-      try {
+      // Writing before flushHeaders would implicitly commit a 200, hiding a 400.
+      if (res.headersSent) {
         res.write(`event: error\ndata: ${JSON.stringify({ message })}\n\n`);
         res.end();
-      } catch {
+      } else {
         res.status(errorStatus(err)).json({ success: false, message });
       }
     }
