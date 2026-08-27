@@ -9,14 +9,23 @@ import {
   type MultiAgentTask,
 } from "../../services/agent/agent";
 import { PROFILES, type ProfileId } from "../../services/agent/profiles";
-import type { ThinkingMode } from "../../services/agent/router";
-import type { ToolCapableProvider } from "../../services/ai";
+import type { ThinkingMode, ProviderSelection } from "../../services/agent/router";
+import {
+  MODEL_CATALOG,
+  REJECTED_MODELS,
+  availableModels,
+  findModel,
+} from "../../services/agent/models";
+import { aiService } from "../../services/ai";
 
 interface RunBody {
   input?: string;
   profile?: ProfileId;
   mode?: ThinkingMode;
-  providerId?: string;
+  /** "auto" (default) lets the backend classifier pick; otherwise a provider id. */
+  providerId?: ProviderSelection;
+  /** Explicit model id chosen in the UI. Overrides automatic selection. */
+  model?: string;
   history?: Array<{ role: string; content: string }>;
   context?: string;
   maxSteps?: number;
@@ -24,10 +33,18 @@ interface RunBody {
   autoApproveMedium?: boolean;
   denyDangerous?: boolean;
   /** Run several agents concurrently over the same input */
-  agents?: Array<{ name?: string; profile: ProfileId; input?: string; mode?: ThinkingMode }>;
+  agents?: Array<{
+    name?: string;
+    profile: ProfileId;
+    input?: string;
+    mode?: ThinkingMode;
+    providerId?: ProviderSelection;
+    model?: string;
+  }>;
 }
 
 const VALID_MODES: ThinkingMode[] = ["auto", "fast", "thinking"];
+const VALID_PROVIDERS: ProviderSelection[] = ["auto", "groq", "openrouter", "nvidia"];
 
 function sseHeaders(res: Response) {
   res.setHeader("Content-Type", "text/event-stream");
@@ -75,11 +92,26 @@ class AgentController {
       });
       return;
     }
+    if (body.providerId && !VALID_PROVIDERS.includes(body.providerId)) {
+      res.status(400).json({
+        success: false,
+        message: `Unknown providerId "${body.providerId}". Valid: ${VALID_PROVIDERS.join(", ")}`,
+      });
+      return;
+    }
+    if (body.model && body.providerId && body.providerId !== "auto" && !findModel(body.providerId, body.model)) {
+      res.status(400).json({
+        success: false,
+        message: `Model "${body.model}" is not in the catalog for provider "${body.providerId}". See GET /api/agent/models.`,
+      });
+      return;
+    }
 
     const shared = {
       history: body.history,
       context: body.context,
-      provider: body.providerId as ToolCapableProvider | undefined,
+      provider: body.providerId,
+      model: body.model,
       maxSteps: body.maxSteps,
       toolTimeoutMs: body.toolTimeoutMs,
       policy: {
@@ -101,6 +133,8 @@ class AgentController {
             name: a.name ?? a.profile,
             profile: a.profile,
             mode: a.mode ?? body.mode,
+            provider: a.providerId ?? body.providerId,
+            model: a.model ?? body.model,
             input: a.input ?? body.input!,
           })),
           abort.signal,
@@ -177,9 +211,43 @@ class AgentController {
           id: p.id,
           label: p.label,
           tools: p.tools,
+          capability: p.capability,
         })),
         modes: VALID_MODES,
+        providers: VALID_PROVIDERS,
         defaultToolTimeoutMs: DEFAULT_TOOL_TIMEOUT_MS,
+      },
+    });
+  }
+
+  /**
+   * GET /api/agent/models
+   *
+   * The described model catalog the UI renders in its picker. `available`
+   * reflects whether the provider has credentials configured. Send
+   * `providerId: "auto"` to let the backend classifier choose instead.
+   */
+  models(_req: Request, res: Response) {
+    const configured = new Set(aiService.toolCapableProviders());
+
+    res.status(200).json({
+      success: true,
+      data: {
+        models: MODEL_CATALOG.map((m) => ({
+          provider: m.provider,
+          model: m.model,
+          label: m.label,
+          description: m.description,
+          bestFor: m.bestFor,
+          tiers: m.tiers,
+          latencyMs: m.latencyMs,
+          contextWindow: m.contextWindow,
+          free: m.free,
+          available: configured.has(m.provider),
+        })),
+        availableCount: availableModels().length,
+        /** Documented so the UI can explain why a model is missing. */
+        rejected: REJECTED_MODELS,
       },
     });
   }

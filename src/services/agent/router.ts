@@ -1,13 +1,24 @@
 import { aiService, type ToolCapableProvider } from "../ai";
+import {
+  findModel,
+  rankModels,
+  type Capability,
+  type ModelEntry,
+  type ModelTier,
+} from "./models";
 
 export type TaskComplexity = "simple" | "hard";
 export type ThinkingMode = "auto" | "fast" | "thinking";
-export type ModelTier = "fast" | "thinking";
+/** `auto` hands provider choice to the classifier; anything else pins it. */
+export type ProviderSelection = ToolCapableProvider | "auto";
+
+export type { ModelTier, Capability };
 
 export interface Classification {
   complexity: TaskComplexity;
   score: number;
   signals: string[];
+  capability: Capability;
 }
 
 /**
@@ -33,9 +44,17 @@ const TRIVIAL_SIGNALS: Array<{ re: RegExp; weight: number; label: string }> = [
   { re: /^\s*(what is|what's|show me|list|display|print|cat|ls)\b/i, weight: -2, label: "lookup" },
 ];
 
-const HARD_THRESHOLD = 7;
+const CAPABILITY_SIGNALS: Array<{ re: RegExp; capability: Capability }> = [
+  { re: /\b(code|function|class|refactor|test|compile|build|lint|typescript|python|import|syntax)\b/i, capability: "coding" },
+  { re: /\b(nginx|systemd|systemctl|docker|kubernetes|k8s|disk|memory|cpu|port|firewall|service|daemon)\b/i, capability: "linux" },
+  { re: /\b(explain|compare|trade-?off|architecture|design|strategy)\b/i, capability: "reasoning" },
+];
 
-export function classify(input: string): Classification {
+const HARD_THRESHOLD = 7;
+/** Beyond this much input, prefer a model with a large context window. */
+const LONG_CONTEXT_CHARS = 40_000;
+
+export function classify(input: string, contextChars = 0): Classification {
   let score = 0;
   const signals: string[] = [];
 
@@ -55,75 +74,71 @@ export function classify(input: string): Classification {
     signals.push("medium-request");
   }
 
-  return { complexity: score >= HARD_THRESHOLD ? "hard" : "simple", score, signals };
+  let capability: Capability = "general";
+  for (const { re, capability: cap } of CAPABILITY_SIGNALS) {
+    if (re.test(input)) {
+      capability = cap;
+      signals.push(`domain:${cap}`);
+      break;
+    }
+  }
+  if (contextChars > LONG_CONTEXT_CHARS) {
+    capability = "long-context";
+    signals.push("long-context");
+  }
+
+  return {
+    complexity: score >= HARD_THRESHOLD ? "hard" : "simple",
+    score,
+    signals,
+    capability,
+  };
 }
 
-// ─── Model catalog ────────────────────────────────────────────────────────────
+// ─── Routing ──────────────────────────────────────────────────────────────────
 
-export interface ModelChoice {
+export type AgentPhase = "planning" | "tool-selection" | "observation" | "final";
+
+export interface RouterConfig {
+  /** `auto` (or omitted) lets the classifier choose; a provider id pins it. */
+  provider?: ProviderSelection;
+  /** Explicit model id from the UI. Requires a pinned provider to be unambiguous. */
+  model?: string;
+  mode?: ThinkingMode;
+  /** Capability hint from the agent profile, overriding the classifier's guess. */
+  capability?: Capability;
+}
+
+export interface RouteDecision {
   provider: ToolCapableProvider;
   model: string;
+  tier: ModelTier;
+  /** The capability actually used for ranking */
+  capability: Capability;
+  /** Why this model was chosen, surfaced to the UI */
+  reason: string;
+  /** Ordered alternatives if the chosen model errors */
+  fallbacks: Array<{ provider: ToolCapableProvider; model: string }>;
 }
 
-/**
- * Ordered preference per tier, measured by real tool-calling latency rather
- * than parameter count. Groq is first because it answered a tool-calling turn
- * in ~0.6s where NVIDIA took 2.5-28s for the same weights.
- */
-const FAST_CHAIN: ModelChoice[] = [
-  { provider: "groq", model: "openai/gpt-oss-20b" },
-  { provider: "groq", model: "openai/gpt-oss-120b" },
-  { provider: "openrouter", model: "liquid/lfm-2.5-2.6b:free" },
-  { provider: "openrouter", model: "nvidia/nemotron-3.5-lightning:free" },
-  { provider: "nvidia", model: "openai/gpt-oss-20b" },
-];
-
-const THINKING_CHAIN: ModelChoice[] = [
-  { provider: "groq", model: "openai/gpt-oss-120b" },
-  { provider: "groq", model: "qwen/qwen3.8-27b" },
-  { provider: "openrouter", model: "z-ai/glm-5.2:free" },
-  { provider: "openrouter", model: "minimax/minimax-m3:free" },
-  { provider: "openrouter", model: "nvidia/nemotron-3-ultra-550b-a55b:free" },
-  { provider: "nvidia", model: "openai/gpt-oss-20b" },
-];
-
-/** Code-oriented work prefers code-tuned weights, still fast-first. */
-const CODING_CHAIN: ModelChoice[] = [
-  { provider: "groq", model: "openai/gpt-oss-120b" },
-  { provider: "groq", model: "qwen/qwen3.8-27b" },
-  { provider: "openrouter", model: "cohere/north-mini-code:free" },
-  { provider: "openrouter", model: "z-ai/glm-5.2:free" },
-];
-
 /** `AGENT_FAST_MODEL=groq/openai/gpt-oss-20b` style override. */
-function envOverride(name: string): ModelChoice | undefined {
-  const raw = process.env[name];
+function envOverride(tier: ModelTier) {
+  const raw = process.env[tier === "thinking" ? "AGENT_THINKING_MODEL" : "AGENT_FAST_MODEL"];
   if (!raw) return undefined;
   const [provider, ...rest] = raw.split("/");
   if (!rest.length) return undefined;
   return { provider: provider as ToolCapableProvider, model: rest.join("/") };
 }
 
-export interface RouteDecision extends ModelChoice {
-  tier: ModelTier;
-  /** Remaining candidates, in order, to try if the chosen one fails */
-  fallbacks: ModelChoice[];
-}
-
-export type AgentPhase = "planning" | "tool-selection" | "observation" | "final";
-
-export interface RouterConfig {
-  /** Force a provider; ignored when that provider is unconfigured */
-  provider?: ToolCapableProvider;
-  /** Force a tier, bypassing classification */
-  mode?: ThinkingMode;
-  /** Prefer the coding-tuned chain */
-  coding?: boolean;
+function toChoice(m: ModelEntry | { provider: ToolCapableProvider; model: string }) {
+  return { provider: m.provider, model: m.model };
 }
 
 /**
- * Pick a model for a phase. In `auto` mode only genuinely hard work during
- * planning or observation gets the thinking tier; everything else stays fast.
+ * Resolve the model for a phase.
+ *
+ * Precedence: explicit UI model → env override → catalog ranking driven by the
+ * classifier. Fallbacks are always the remaining ranked catalog entries.
  */
 export function selectModel(
   phase: AgentPhase,
@@ -142,26 +157,94 @@ export function selectModel(
         ? "thinking"
         : "fast";
 
-  const base = cfg.coding ? CODING_CHAIN : tier === "thinking" ? THINKING_CHAIN : FAST_CHAIN;
-  const override = envOverride(tier === "thinking" ? "AGENT_THINKING_MODEL" : "AGENT_FAST_MODEL");
+  // A context payload too large for a small window outranks the profile hint.
+  const capability: Capability =
+    classification.capability === "long-context"
+      ? "long-context"
+      : cfg.capability ?? classification.capability;
+  const ranked = rankModels(tier, capability);
+  const pinned = cfg.provider && cfg.provider !== "auto" ? cfg.provider : undefined;
 
-  let chain = base.filter((c) => available.has(c.provider));
+  // 1. Explicit model from the UI.
+  if (cfg.model) {
+    const resolvedProvider =
+      pinned ??
+      (["groq", "openrouter", "nvidia"] as ToolCapableProvider[]).find((p) =>
+        findModel(p, cfg.model!),
+      );
 
-  if (cfg.provider && available.has(cfg.provider)) {
-    const preferred = chain.filter((c) => c.provider === cfg.provider);
-    if (preferred.length) {
-      chain = preferred.concat(chain.filter((c) => c.provider !== cfg.provider));
+    if (!resolvedProvider) {
+      throw new Error(
+        `Model "${cfg.model}" is not in the catalog. Pass providerId to use an uncatalogued model.`,
+      );
     }
+    if (!available.has(resolvedProvider)) {
+      throw new Error(`Provider "${resolvedProvider}" is not configured.`);
+    }
+    return {
+      provider: resolvedProvider,
+      model: cfg.model,
+      tier,
+      capability,
+      reason: "Explicitly selected by the client",
+      fallbacks: ranked.filter((m) => m.model !== cfg.model).map(toChoice),
+    };
   }
+
+  // 2. Provider pinned but model left to us.
+  if (pinned) {
+    if (!available.has(pinned)) throw new Error(`Provider "${pinned}" is not configured.`);
+    const preferred = ranked.filter((m) => m.provider === pinned);
+    const chosen = preferred[0];
+    if (chosen) {
+      return {
+        ...toChoice(chosen),
+        tier,
+        capability,
+        reason: `Fastest ${tier} model for "${capability}" on ${pinned}`,
+        fallbacks: [...preferred.slice(1), ...ranked.filter((m) => m.provider !== pinned)].map(toChoice),
+      };
+    }
+    return {
+      provider: pinned,
+      model: aiService.defaultToolModel(pinned),
+      tier,
+      capability,
+      reason: `Provider default for ${pinned}`,
+      fallbacks: ranked.map(toChoice),
+    };
+  }
+
+  // 3. Fully automatic.
+  const override = envOverride(tier);
   if (override && available.has(override.provider)) {
-    chain = [override, ...chain.filter((c) => c.model !== override.model)];
+    return {
+      ...override,
+      tier,
+      capability,
+      reason: `Environment override for the ${tier} tier`,
+      fallbacks: ranked.filter((m) => m.model !== override.model).map(toChoice),
+    };
   }
 
-  if (!chain.length) {
+  const [chosen, ...rest] = ranked;
+  if (!chosen) {
     const provider = [...available][0];
-    return { provider, model: aiService.defaultToolModel(provider), tier, fallbacks: [] };
+    return {
+      provider,
+      model: aiService.defaultToolModel(provider),
+      tier,
+      capability,
+      reason: "No catalog entry matched; using the provider default",
+      fallbacks: [],
+    };
   }
 
-  const [chosen, ...fallbacks] = chain;
-  return { ...chosen, tier, fallbacks };
+  return {
+    ...toChoice(chosen),
+    tier,
+    capability,
+    reason: `Auto: fastest ${tier}-tier model for "${capability}" (${chosen.latencyMs}ms measured)`,
+    fallbacks: rest.map(toChoice),
+  };
 }

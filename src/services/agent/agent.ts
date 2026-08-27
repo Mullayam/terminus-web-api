@@ -1,8 +1,8 @@
 import { randomUUID } from "crypto";
 import { Logging } from "@enjoys/express-utils/logger";
-import { aiService, type AiChatMessage, type ToolCapableProvider } from "../ai";
+import { aiService, type AiChatMessage, type ToolChatResult } from "../ai";
 import { AgentContext } from "./context";
-import { classify, selectModel, type Classification, type ThinkingMode } from "./router";
+import { classify, selectModel, type Classification, type ThinkingMode, type ProviderSelection } from "./router";
 import { resolveCall, toolDefinitions, type ResolvedCall } from "./tools";
 import type { PolicyOptions, RiskAssessment } from "./security";
 import { PROFILES, inferProfile, type ProfileId } from "./profiles";
@@ -17,7 +17,17 @@ export interface AgentEventBase {
 export type AgentEvent = AgentEventBase &
   (
     | { type: "status"; message: string }
-    | { type: "routing"; provider: string; model: string; tier: string; profile: ProfileId; complexity: string; signals: string[] }
+    | {
+        type: "routing";
+        provider: string;
+        model: string;
+        tier: string;
+        reason: string;
+        profile: ProfileId;
+        complexity: string;
+        capability: string;
+        signals: string[];
+      }
     | { type: "plan"; steps: string[] }
     | { type: "chunk"; text: string }
     | {
@@ -96,7 +106,9 @@ export interface AgentRunOptions {
   profile?: ProfileId;
   mode?: ThinkingMode;
   history?: Array<{ role: string; content: string }>;
-  provider?: ToolCapableProvider;
+  provider?: ProviderSelection;
+  /** Explicit catalog model id chosen in the UI */
+  model?: string;
   policy?: PolicyOptions;
   maxSteps?: number;
   toolTimeoutMs?: number;
@@ -114,7 +126,7 @@ const MAX_TOOL_TIMEOUT_MS = 20_000;
 async function buildPlan(
   input: string,
   classification: Classification,
-  cfg: { provider?: ToolCapableProvider; mode?: ThinkingMode; coding?: boolean },
+  cfg: Parameters<typeof selectModel>[2],
 ): Promise<string[]> {
   const route = selectModel("planning", classification, cfg);
   const gen = aiService.streamWithTools({
@@ -143,7 +155,11 @@ async function* turnWithFallback(
   route: ReturnType<typeof selectModel>,
   messages: AiChatMessage[],
   tools: ReturnType<typeof toolDefinitions>,
-) {
+): AsyncGenerator<
+  { kind: "chunk"; text: string } | { kind: "done"; turn: ToolChatResult },
+  void,
+  unknown
+> {
   const candidates = [{ provider: route.provider, model: route.model }, ...route.fallbacks];
   let lastError: string | undefined;
 
@@ -155,13 +171,13 @@ async function* turnWithFallback(
         messages,
         tools: tools.length ? tools : undefined,
       });
-      let r = await gen.next();
+      let r: IteratorResult<string, ToolChatResult> = await gen.next();
       // Once tokens are flowing, a mid-stream failure cannot be retried elsewhere.
       while (!r.done) {
-        yield { kind: "chunk" as const, text: r.value };
+        yield { kind: "chunk", text: r.value };
         r = await gen.next();
       }
-      yield { kind: "done" as const, turn: r.value };
+      yield { kind: "done", turn: r.value };
       return;
     } catch (err: any) {
       lastError = err?.message ?? String(err);
@@ -183,20 +199,34 @@ export async function* runAgent(opts: AgentRunOptions): AsyncGenerator<AgentEven
   const maxSteps = Math.min(opts.maxSteps ?? 12, 25);
   const toolTimeoutMs = Math.min(opts.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS, MAX_TOOL_TIMEOUT_MS);
   const policy = opts.policy ?? {};
-  const routerCfg = { provider: opts.provider, mode: opts.mode, coding: profile.coding };
+  const routerCfg = {
+    provider: opts.provider,
+    model: opts.model,
+    mode: opts.mode,
+    capability: profile.capability,
+  };
 
-  const classification = classify(opts.input);
+  const classification = classify(opts.input, opts.context?.length ?? 0);
   yield { agent, type: "status", message: "Analyzing request" };
 
-  const route = selectModel("tool-selection", classification, routerCfg);
+  let route;
+  try {
+    route = selectModel("tool-selection", classification, routerCfg);
+  } catch (err: any) {
+    yield { agent, type: "error", message: err?.message ?? String(err) };
+    return;
+  }
+
   yield {
     agent,
     type: "routing",
     provider: route.provider,
     model: route.model,
     tier: route.tier,
+    reason: route.reason,
     profile: profileId,
     complexity: classification.complexity,
+    capability: route.capability,
     signals: classification.signals,
   };
 

@@ -43,6 +43,7 @@ router.post("/chat/ai", AiController.default.chatWithAI);
 
 // Agent
 router.get("/agent/profiles", AgentController.default.profiles);
+router.get("/agent/models", AgentController.default.models);
 router.post("/agent/run", AgentController.default.run);
 router.post("/agent/result", AgentController.default.result);
 

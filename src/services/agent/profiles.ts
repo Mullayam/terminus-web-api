@@ -1,13 +1,15 @@
 export type ProfileId = "linux" | "coding" | "reasoning";
 
+import type { Capability } from "./models";
+
 export interface AgentProfile {
   id: ProfileId;
   label: string;
   system: string;
   /** Tool names this profile may call; empty means no tools. */
   tools: string[];
-  /** Route through the coding-tuned model chain */
-  coding?: boolean;
+  /** Capability hint handed to the router, overriding the classifier's guess. */
+  capability: Capability;
 }
 
 const SHARED_RULES = `
@@ -23,6 +25,7 @@ export const PROFILES: Record<ProfileId, AgentProfile> = {
   linux: {
     id: "linux",
     label: "Linux Ops",
+    capability: "linux",
     tools: [
       "run_command",
       "read_file",
@@ -45,7 +48,7 @@ ${SHARED_RULES}`,
   coding: {
     id: "coding",
     label: "Coding",
-    coding: true,
+    capability: "coding",
     tools: ["read_file", "list_dir", "search_files", "write_file", "run_command"],
     system: `You are Terminus Coding, a software engineer working in a repository on a remote host.
 
@@ -58,6 +61,7 @@ ${SHARED_RULES}`,
   reasoning: {
     id: "reasoning",
     label: "Reasoning",
+    capability: "reasoning",
     tools: [],
     system: `You are Terminus Reasoning, an analyst.
 
