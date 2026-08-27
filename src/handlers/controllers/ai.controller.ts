@@ -1,9 +1,18 @@
 import type { Request, Response } from "express";
-import { aiService, type AiProvider, type AiMessage } from "../../services/ai";
+import { aiService, type AiMessage } from "../../services/ai";
+import { availableChatModels, inlineModels, resolveChatModel, resolveInlineModel } from "../../services/agent/models";
 import { readFileSync } from "fs";
 import { Logging } from "@enjoys/express-utils/logger";
  
 const DEFAULT_PROMPT = (model:string)=> readFileSync("claude-sonet.4.6.txt", "utf8").replaceAll("{{model_name}}", model);
+
+const PROVIDER_LABELS: Record<string, string> = {
+  groq: "Groq",
+  openrouter: "OpenRouter",
+  nvidia: "NVIDIA NIM",
+  mistral: "Mistral AI",
+  gemini: "Google Gemini",
+};
 // ─── Monaco Hover Provider — System Prompt ────────────────────────────────────
 const MONACO_HOVER_SYSTEM_PROMPT = (language: string) => `You are a Monaco Editor hover information provider specialized in ${language}.
 <core_identity>
@@ -340,6 +349,9 @@ interface CompletionPayload {
   textBeforeCursor: string;
   textAfterCursor: string;
   cursorPosition: { lineNumber: number; column: number };
+  /** "auto" or a provider id; omitted means auto */
+  providerId?: string;
+  modelId?: string;
 }
 
 /**
@@ -380,6 +392,7 @@ function buildUserPrompt(body: CompletionPayload): string {
  * Validates the incoming body and returns an error message or null if valid.
  */
 function validateBody(body: any): string | null {
+  if (!body) return "Request body is required.";
   if (!body.language || typeof body.language !== "string") {
     return 'language is required (e.g. "typescript", "python").';
   }
@@ -395,6 +408,40 @@ function validateBody(body: any): string | null {
   return null;
 }
 
+/** Raised when the client asks for a provider/model that cannot be served. */
+class ModelSelectionError extends Error {}
+
+/**
+ * Resolves the client's provider/model choice into AI service options.
+ * An empty or "auto" selection returns {} so the service runs its fallback chain.
+ */
+function modelOptions(providerId?: string, modelId?: string) {
+  try {
+    const resolved = resolveChatModel(providerId, modelId);
+    return resolved ? { provider: resolved.provider, model: resolved.model } : {};
+  } catch (err: any) {
+    throw new ModelSelectionError(err?.message ?? "Invalid model selection.");
+  }
+}
+
+/**
+ * Same, for inline completion and ghost text. Always pins a model so "auto"
+ * never falls through to the service's NVIDIA-first chain.
+ */
+function inlineModelOptions(providerId?: string, modelId?: string) {
+  try {
+    const resolved = resolveInlineModel(providerId, modelId);
+    return { provider: resolved.provider, model: resolved.model };
+  } catch (err: any) {
+    throw new ModelSelectionError(err?.message ?? "Invalid model selection.");
+  }
+}
+
+/** 400 for a bad client selection, 500 for anything else. */
+function errorStatus(err: unknown): number {
+  return err instanceof ModelSelectionError ? 400 : 500;
+}
+
 class AiController {
   async completions(req: Request, res: Response) {
     try {
@@ -402,19 +449,39 @@ class AiController {
         filename?: string;
         language: string;
         range: { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number };
+        textBeforeCursor?: string;
+        textAfterCursor?: string;
+        providerId?: string;
+        modelId?: string;
       };
 
+      if (!body?.language || typeof body.language !== "string") {
+        res.status(400).json({ items: [], error: 'language is required (e.g. "typescript").' });
+        return;
+      }
 
       const range = body.range ?? { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 };
 
+      // Without the surrounding source the model can only emit generic keywords.
+      const contextParts: string[] = [];
+      if (body.textBeforeCursor) {
+        contextParts.push(`Code before cursor:\n\`\`\`\n${body.textBeforeCursor.slice(-4000)}\n\`\`\``);
+      }
+      if (body.textAfterCursor) {
+        contextParts.push(`Code after cursor:\n\`\`\`\n${body.textAfterCursor.slice(0, 2000)}\n\`\`\``);
+      }
+
       const result = await aiService.generate({
-        prompt: "Generate Monaco Editor completion items for this language and file, based on the cursor position. Respond ONLY with a JSON object like {\"items\":[...]} containing completion items. No explanation, no markdown.",
+        ...inlineModelOptions(body.providerId, body.modelId),
+        prompt:
+          (contextParts.length ? `${contextParts.join("\n\n")}\n\n` : "") +
+          'Generate Monaco Editor completion items for this language and file, based on the cursor position. Respond ONLY with a JSON object like {"items":[...]} containing completion items. No explanation, no markdown.',
         system: MONACO_COMPLETION_SYSTEM_PROMPT(
           body.language,
           body.filename ?? "unknown",
           JSON.stringify(range),
         ),
-        maxTokens: 12000,
+        maxTokens: 4096,
         temperature: 0.3,
         responseFormat: "json_object",
       });
@@ -472,7 +539,7 @@ class AiController {
 
       res.status(200).json({ items: items, error: "" });
     } catch (err: any) {
-      res.status(500).json({
+      res.status(errorStatus(err)).json({
         items: [],
         error: err instanceof Error ? err.message : "AI generation failed.",
       });
@@ -484,7 +551,7 @@ class AiController {
    */
   async generate(req: Request, res: Response) {
     try {
-      const body = req.body?.completionMetadata as CompletionPayload;
+      const body = (req.body?.completionMetadata ?? req.body) as CompletionPayload;
 
       const error = validateBody(body);
       if (error) {
@@ -493,6 +560,7 @@ class AiController {
       }
 
       const result = await aiService.generate({
+        ...inlineModelOptions(body.providerId, body.modelId),
         prompt: buildUserPrompt(body),
         system: buildSystemPrompt(body.language, body.filename ?? "unknown"),
       });
@@ -504,7 +572,7 @@ class AiController {
       }
       res.status(200).json({ completion: result.text, error: "" });
     } catch (err: any) {
-      res.status(500).json({
+      res.status(errorStatus(err)).json({
         success: false,
         message: err instanceof Error ? err.message : "AI generation failed.",
       });
@@ -523,12 +591,14 @@ class AiController {
    */
   async stream(req: Request, res: Response) {
     try {
-      const body = req.body as CompletionPayload;
+      const body = (req.body?.completionMetadata ?? req.body) as CompletionPayload;
       const error = validateBody(body);
       if (error) {
         res.status(400).json({ success: false, message: error });
         return;
       }
+
+      const streamOptions = modelOptions(body.providerId, body.modelId);
 
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
@@ -536,6 +606,7 @@ class AiController {
       res.flushHeaders();
 
       const gen = aiService.stream({
+        ...streamOptions,
         prompt: buildUserPrompt(body),
         system: buildSystemPrompt(body.language, body.filename ?? "unknown"),
       });
@@ -560,7 +631,7 @@ class AiController {
         res.write(`event: error\ndata: ${JSON.stringify({ message })}\n\n`);
         res.end();
       } catch {
-        res.status(500).json({ success: false, message });
+        res.status(errorStatus(err)).json({ success: false, message });
       }
     }
   }
@@ -568,15 +639,50 @@ class AiController {
 
   /**
    * GET /api/ai/providers
+   *
+   * Verified catalog: only models confirmed reachable on a configured provider.
+   * Every entry here is valid to send back as `providerId` + `modelId`.
    */
   providers(_req: Request, res: Response) {
     try {
-      res.status(200).json({
-        success: true,
-        data: aiService.getProviderDetails(),
-      });
+      const configured = new Set<string>(aiService.availableProviders());
+      const inlineOk = new Set(inlineModels().map((m) => `${m.provider}/${m.model}`));
+      const byProvider = new Map<string, any>();
+
+      for (const m of availableChatModels()) {
+        if (!byProvider.has(m.provider)) {
+          byProvider.set(m.provider, {
+            id: m.provider,
+            name: PROVIDER_LABELS[m.provider] ?? m.provider,
+            icon: m.provider,
+            available: configured.has(m.provider),
+            supportsTools: false,
+            supportsInline: false,
+            models: [],
+          });
+        }
+        const entry = byProvider.get(m.provider);
+        entry.supportsTools ||= m.supportsTools;
+        const supportsInline = inlineOk.has(`${m.provider}/${m.model}`);
+        entry.supportsInline ||= supportsInline;
+        entry.models.push({
+          id: m.model,
+          name: m.label,
+          description: m.description,
+          bestFor: m.bestFor,
+          complexity: m.complexity,
+          maxTokens: m.contextWindow,
+          latencyMs: m.latencyMs,
+          free: m.free,
+          supportsTools: m.supportsTools,
+          /** False for models too slow to serve ghost text. */
+          supportsInline,
+        });
+      }
+
+      res.status(200).json({ success: true, data: [...byProvider.values()] });
     } catch (err: any) {
-      res.status(500).json({
+      res.status(errorStatus(err)).json({
         success: false,
         message: err instanceof Error ? err.message : "Failed.",
       });
@@ -621,11 +727,10 @@ class AiController {
       res.flushHeaders();
 
       const gen = aiService.stream({
+        ...modelOptions(body.providerId, body.modelId),
         prompt: body.question,
         system: systemParts.join("\n"),
         history,
-        provider: body.providerId as AiProvider | undefined,
-        model: body.modelId,
       });
        let iterResult = await gen.next();
       while (!iterResult.done) {
@@ -641,7 +746,7 @@ class AiController {
       res.write(`event: done\ndata: ${JSON.stringify({ text: final.text })}\n\n`);
       res.end();
     } catch (err: any) {
-      res.status(500).json({
+      res.status(errorStatus(err)).json({
         success: false,
         message: err instanceof Error ? err.message : "Failed.",
       });
@@ -721,11 +826,10 @@ You don't need to read a file if it's already provided in context.
       res.flushHeaders();
 
       const gen = aiService.stream({
+        ...modelOptions(body.providerId, body.modelId),
         prompt: body.question,
         system: systemParts.join("\n"),
         history,
-        provider: body.providerId as AiProvider | undefined,
-        model: body.modelId,
       });
 
       let iterResult = await gen.next();
@@ -744,7 +848,7 @@ You don't need to read a file if it's already provided in context.
         res.write(`event: error\ndata: ${JSON.stringify({ message })}\n\n`);
         res.end();
       } catch {
-        res.status(500).json({ success: false, message });
+        res.status(errorStatus(err)).json({ success: false, message });
       }
     }
   }
@@ -762,6 +866,8 @@ You don't need to read a file if it's already provided in context.
         context: string;
         language: string;
         filename?: string;
+        providerId?: string;
+        modelId?: string;
       };
 
       if (!body.word || typeof body.word !== "string") {
@@ -774,6 +880,7 @@ You don't need to read a file if it's already provided in context.
       }
 
       const result = await aiService.generate({
+        ...modelOptions(body.providerId, body.modelId),
         prompt: `word: ${body.word}\nfilename: ${body.filename ?? "unknown"}\ncontext:\n${body.context ?? ""}`,
         system: MONACO_HOVER_SYSTEM_PROMPT(body.language),
         maxTokens: 1024,
@@ -788,7 +895,7 @@ You don't need to read a file if it's already provided in context.
         model: result.model,
       });
     } catch (err: any) {
-      res.status(500).json({
+      res.status(errorStatus(err)).json({
         success: false,
         message: err instanceof Error ? err.message : "AI hover failed.",
       });

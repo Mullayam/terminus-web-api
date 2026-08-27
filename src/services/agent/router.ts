@@ -3,16 +3,18 @@ import {
   findModel,
   rankModels,
   type Capability,
-  type ModelEntry,
+  type ComplexityCeiling,
   type ModelTier,
+  type ToolModelEntry,
 } from "./models";
 
-export type TaskComplexity = "simple" | "hard";
+/** Mirrors the catalog's complexity ceiling: a task needs a model that reaches it. */
+export type TaskComplexity = ComplexityCeiling;
 export type ThinkingMode = "auto" | "fast" | "thinking";
 /** `auto` hands provider choice to the classifier; anything else pins it. */
 export type ProviderSelection = ToolCapableProvider | "auto";
 
-export type { ModelTier, Capability };
+export type { ModelTier, Capability, ComplexityCeiling };
 
 export interface Classification {
   complexity: TaskComplexity;
@@ -45,14 +47,26 @@ const TRIVIAL_SIGNALS: Array<{ re: RegExp; weight: number; label: string }> = [
 ];
 
 const CAPABILITY_SIGNALS: Array<{ re: RegExp; capability: Capability }> = [
+  { re: /\b(debug|troubleshoot|diagnose|stack ?trace|traceback|core dump|root cause)\b/i, capability: "debugging" },
+  { re: /\b(permission|chmod|chown|sudo|secret|credential|token|tls|ssl|cert|vulnerab|cve|hardening)\b/i, capability: "security" },
   { re: /\b(code|function|class|refactor|test|compile|build|lint|typescript|python|import|syntax)\b/i, capability: "coding" },
   { re: /\b(nginx|systemd|systemctl|docker|kubernetes|k8s|disk|memory|cpu|port|firewall|service|daemon)\b/i, capability: "linux" },
-  { re: /\b(explain|compare|trade-?off|architecture|design|strategy)\b/i, capability: "reasoning" },
+  { re: /\b(summari[sz]e|tl;?dr|condense|digest|recap)\b/i, capability: "summarization" },
+  { re: /\b(plan|roadmap|steps to|migrate|rollout|checklist)\b/i, capability: "planning" },
+  { re: /\b(explain|walk me through|document)\b/i, capability: "explanation" },
+  { re: /\b(compare|trade-?off|architecture|design|strategy)\b/i, capability: "reasoning" },
 ];
 
 const HARD_THRESHOLD = 7;
+const MODERATE_THRESHOLD = 4;
 /** Beyond this much input, prefer a model with a large context window. */
 const LONG_CONTEXT_CHARS = 40_000;
+
+function toComplexity(score: number): TaskComplexity {
+  if (score >= HARD_THRESHOLD) return "hard";
+  if (score >= MODERATE_THRESHOLD) return "moderate";
+  return "simple";
+}
 
 export function classify(input: string, contextChars = 0): Classification {
   let score = 0;
@@ -88,7 +102,7 @@ export function classify(input: string, contextChars = 0): Classification {
   }
 
   return {
-    complexity: score >= HARD_THRESHOLD ? "hard" : "simple",
+    complexity: toComplexity(score),
     score,
     signals,
     capability,
@@ -130,7 +144,7 @@ function envOverride(tier: ModelTier) {
   return { provider: provider as ToolCapableProvider, model: rest.join("/") };
 }
 
-function toChoice(m: ModelEntry | { provider: ToolCapableProvider; model: string }) {
+function toChoice(m: ToolModelEntry | { provider: ToolCapableProvider; model: string }) {
   return { provider: m.provider, model: m.model };
 }
 
@@ -162,7 +176,7 @@ export function selectModel(
     classification.capability === "long-context"
       ? "long-context"
       : cfg.capability ?? classification.capability;
-  const ranked = rankModels(tier, capability);
+  const ranked = rankModels(tier, capability, classification.complexity);
   const pinned = cfg.provider && cfg.provider !== "auto" ? cfg.provider : undefined;
 
   // 1. Explicit model from the UI.

@@ -11,6 +11,7 @@ import {
 import { PROFILES, type ProfileId } from "../../services/agent/profiles";
 import type { ThinkingMode, ProviderSelection } from "../../services/agent/router";
 import {
+  CAPABILITY_META,
   MODEL_CATALOG,
   REJECTED_MODELS,
   availableModels,
@@ -228,7 +229,8 @@ class AgentController {
    * `providerId: "auto"` to let the backend classifier choose instead.
    */
   models(_req: Request, res: Response) {
-    const configured = new Set(aiService.toolCapableProviders());
+    // Covers chat-only providers too, since the catalog now spans both.
+    const configured = new Set<string>(aiService.availableProviders());
 
     res.status(200).json({
       success: true,
@@ -240,11 +242,15 @@ class AgentController {
           description: m.description,
           bestFor: m.bestFor,
           tiers: m.tiers,
+          complexity: m.complexity,
           latencyMs: m.latencyMs,
           contextWindow: m.contextWindow,
           free: m.free,
+          supportsTools: m.supportsTools,
           available: configured.has(m.provider),
         })),
+        /** Label and description per capability tag, so the UI can explain `bestFor`. */
+        capabilities: CAPABILITY_META,
         availableCount: availableModels().length,
         /** Documented so the UI can explain why a model is missing. */
         rejected: REJECTED_MODELS,
