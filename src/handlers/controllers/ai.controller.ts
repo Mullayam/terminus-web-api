@@ -10,6 +10,19 @@ import {
 } from "../../services/agent/models";
 import { readFileSync } from "fs";
 import { Logging } from "@enjoys/express-utils/logger";
+import {
+  completionCache,
+  completionCacheKey,
+  COMPLETION_TTL_MS,
+} from "../../services/store";
+
+/**
+ * Completions are cached per language, so only a cold miss pays generation cost
+ * and the budget can be generous. It cannot be unlimited: `max_tokens` counts
+ * against Groq's per-minute token budget, and 32768 returns 413 on the free
+ * tier (limit 8000 TPM). Raise via env once on a paid tier.
+ */
+const MAX_COMPLETION_TOKENS = Number(process.env.AI_COMPLETION_MAX_TOKENS ?? 4096);
  
 const DEFAULT_PROMPT = (model:string)=> readFileSync("claude-sonet.4.6.txt", "utf8").replaceAll("{{model_name}}", model);
 
@@ -470,6 +483,8 @@ class AiController {
         textAfterCursor?: string;
         providerId?: string;
         modelId?: string;
+        /** Bypass the cache and regenerate the item set for this language. */
+        refresh?: boolean;
       };
 
       if (!body?.language || typeof body.language !== "string") {
@@ -478,6 +493,28 @@ class AiController {
       }
 
       const range = body.range ?? { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 };
+      const selection = inlineModelOptions(body.providerId, body.modelId);
+      const cacheKey = completionCacheKey(
+        body.language,
+        selection.provider,
+        selection.model ?? "default",
+      );
+
+      // The item set is language-generic: `range` is injected per request below,
+      // so one generation serves every cursor position in that language.
+      if (!body.refresh) {
+        const cached = await completionCache.get(cacheKey).catch(() => null);
+        if (cached?.length) {
+          res.setHeader("X-Cache", "HIT");
+          res.setHeader("X-AI-Provider", selection.provider);
+          res.setHeader("X-AI-Model", selection.model ?? "");
+          res.status(200).json({
+            items: cached.map((item: Record<string, any>) => ({ ...item, range })),
+            error: "",
+          });
+          return;
+        }
+      }
 
       // Without the surrounding source the model can only emit generic keywords.
       const contextParts: string[] = [];
@@ -489,7 +526,7 @@ class AiController {
       }
 
       const result = await aiService.generate({
-        ...inlineModelOptions(body.providerId, body.modelId),
+        ...selection,
         prompt:
           (contextParts.length ? `${contextParts.join("\n\n")}\n\n` : "") +
           'Generate Monaco Editor completion items for this language and file, based on the cursor position. Respond ONLY with a JSON object like {"items":[...]} containing completion items. No explanation, no markdown.',
@@ -498,7 +535,7 @@ class AiController {
           body.filename ?? "unknown",
           JSON.stringify(range),
         ),
-        maxTokens: 4096,
+        maxTokens: MAX_COMPLETION_TOKENS,
         temperature: 0.3,
         responseFormat: "json_object",
       });
@@ -549,11 +586,19 @@ class AiController {
 
       Logging.dev(`[AI:completions] Got ${items.length} items from ${result.provider}/${result.model}`);
 
+      // Cached without `range` so the same set serves every cursor position.
+      void completionCache
+        .set(cacheKey, items, COMPLETION_TTL_MS)
+        .catch((err: any) => Logging.dev(`[AI:completions] Cache write failed: ${err?.message}`, "notice"));
+
       // Inject range into every item (saves tokens by not requiring AI to repeat it)
       for (const item of items) {
         item.range = range;
       }
 
+      res.setHeader("X-Cache", "MISS");
+      res.setHeader("X-AI-Provider", result.provider);
+      res.setHeader("X-AI-Model", result.model);
       res.status(200).json({ items: items, error: "" });
     } catch (err: any) {
       res.status(errorStatus(err)).json({
