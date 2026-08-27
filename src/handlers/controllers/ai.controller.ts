@@ -601,21 +601,31 @@ class AiController {
         res.status(400).json({ success: false, message: "question is required." });
         return;
       }
-      const systemPrompt = DEFAULT_PROMPT(body.modelId)
+      const systemParts = [DEFAULT_PROMPT(body.modelId)];
+      if (body.context) {
+        systemParts.push("Here is the relevant context the user is looking at:");
+        systemParts.push("```\n" + body.context + "\n```");
+      }
+      if (body.selection) {
+        systemParts.push("The user has selected:");
+        systemParts.push("```\n" + body.selection + "\n```");
+      }
+
+      const history: AiMessage[] = (body.history ?? [])
+        .slice(-10)
+        .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
+
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
       res.flushHeaders();
-      const userPrompt =[
-        {
-          role: "user",
-          content: body.question
-        },
-        ...(body.history ?? []).slice(-10) // include last 10 messages from history for context
-      ]
+
       const gen = aiService.stream({
-        prompt: userPrompt.map(p => `${p.role}: ${p.content}`).join("\n\n"),
-        system: systemPrompt
+        prompt: body.question,
+        system: systemParts.join("\n"),
+        history,
+        provider: body.providerId as AiProvider | undefined,
+        model: body.modelId,
       });
        let iterResult = await gen.next();
       while (!iterResult.done) {
