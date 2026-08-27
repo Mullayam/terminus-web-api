@@ -394,6 +394,75 @@ export function inlineModels(): ModelEntry[] {
 }
 
 /**
+ * Fast-tier models matching any of `capabilities`, fastest first.
+ * Falls back to all fast models if nothing matches, so a niche capability
+ * never leaves an endpoint with nothing to call.
+ */
+function fastModelsFor(capabilities: Capability[]): ModelEntry[] {
+  const pool = inlineModels().filter((m) => m.tiers.includes("fast"));
+  const matches = pool.filter((m) => capabilities.some((c) => m.bestFor.includes(c)));
+  return matches.length ? matches : pool;
+}
+
+/**
+ * Models for hover documentation: fast, and able to explain code.
+ * Hover fires on mouse-over, so latency matters as much as it does inline.
+ */
+export function hoverModels(): ModelEntry[] {
+  return fastModelsFor(["coding", "explanation"]);
+}
+
+/** Resolve a model selection for hover, preferring fast coding models. */
+export function resolveHoverModel(
+  providerId?: string,
+  modelId?: string,
+): { provider: AiProvider; model?: string } {
+  return resolveLatencySensitive(hoverModels(), "hover", providerId, modelId);
+}
+
+/**
+ * Shared resolution for latency-sensitive endpoints.
+ *
+ * "auto" pins an explicit model rather than returning `undefined`, because the
+ * AI service's own fallback chain starts at NVIDIA — which would make every
+ * automatic request multi-second.
+ */
+function resolveLatencySensitive(
+  candidates: ModelEntry[],
+  label: string,
+  providerId?: string,
+  modelId?: string,
+): { provider: AiProvider; model?: string } {
+  const wantsAuto = !providerId || providerId === "auto";
+
+  if (!wantsAuto && INLINE_EXCLUDED_PROVIDERS.has(providerId as AiProvider)) {
+    throw new Error(
+      `Provider "${providerId}" is not supported for ${label}; it is too slow. Use one of: ${[
+        ...new Set(inlineModels().map((m) => m.provider)),
+      ].join(", ")}.`,
+    );
+  }
+
+  if (wantsAuto && !modelId) {
+    const fastest = candidates[0];
+    if (!fastest) throw new Error(`No provider suitable for ${label} is configured.`);
+    return { provider: fastest.provider, model: fastest.model };
+  }
+
+  const resolved = resolveChatModel(providerId, modelId);
+  if (resolved && INLINE_EXCLUDED_PROVIDERS.has(resolved.provider)) {
+    throw new Error(
+      `Model "${modelId}" runs on "${resolved.provider}", which is not supported for ${label}.`,
+    );
+  }
+  if (resolved) return resolved;
+
+  const fastest = candidates[0];
+  if (!fastest) throw new Error(`No provider suitable for ${label} is configured.`);
+  return { provider: fastest.provider, model: fastest.model };
+}
+
+/**
  * Resolve a model selection for inline completion and ghost text.
  *
  * Unlike `resolveChatModel`, "auto" pins an explicit fast model rather than
@@ -404,29 +473,12 @@ export function resolveInlineModel(
   providerId?: string,
   modelId?: string,
 ): { provider: AiProvider; model?: string } {
-  const wantsAuto = !providerId || providerId === "auto";
-
-  if (!wantsAuto && INLINE_EXCLUDED_PROVIDERS.has(providerId as AiProvider)) {
-    throw new Error(
-      `Provider "${providerId}" is not supported for inline completion; it is too slow. Use one of: ${[
-        ...new Set(inlineModels().map((m) => m.provider)),
-      ].join(", ")}.`,
-    );
-  }
-
-  if (wantsAuto && !modelId) {
-    const fastest = inlineModels()[0];
-    if (!fastest) throw new Error("No provider suitable for inline completion is configured.");
-    return { provider: fastest.provider, model: fastest.model };
-  }
-
-  const resolved = resolveChatModel(providerId, modelId);
-  if (resolved && INLINE_EXCLUDED_PROVIDERS.has(resolved.provider)) {
-    throw new Error(
-      `Model "${modelId}" runs on "${resolved.provider}", which is not supported for inline completion.`,
-    );
-  }
-  return resolved ?? { provider: inlineModels()[0].provider, model: inlineModels()[0].model };
+  return resolveLatencySensitive(
+    fastModelsFor(["coding", "general"]),
+    "inline completion",
+    providerId,
+    modelId,
+  );
 }
 
 /**

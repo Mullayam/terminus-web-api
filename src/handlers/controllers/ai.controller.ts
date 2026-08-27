@@ -1,6 +1,13 @@
 import type { Request, Response } from "express";
 import { aiService, type AiMessage } from "../../services/ai";
-import { availableChatModels, inlineModels, resolveChatModel, resolveInlineModel } from "../../services/agent/models";
+import {
+  availableChatModels,
+  hoverModels,
+  inlineModels,
+  resolveChatModel,
+  resolveHoverModel,
+  resolveInlineModel,
+} from "../../services/agent/models";
 import { readFileSync } from "fs";
 import { Logging } from "@enjoys/express-utils/logger";
  
@@ -13,8 +20,8 @@ const PROVIDER_LABELS: Record<string, string> = {
   mistral: "Mistral AI",
   gemini: "Google Gemini",
 };
-// ─── Monaco Hover Provider — System Prompt ────────────────────────────────────
-const MONACO_HOVER_SYSTEM_PROMPT = (language: string) => `You are a Monaco Editor hover information provider specialized in ${language}.
+// ─── Terminus Hover Provider — System Prompt ────────────────────────────────────
+const MONACO_HOVER_SYSTEM_PROMPT = (language: string) => `You are a Terminus Editor hover information provider specialized in ${language}.
 <core_identity>
 You are an assistant called ENJOYS, developed and created by ENJOYS, whose sole purpose is to analyze and solve problems asked by the user or shown on the screen. Your responses must be specific, accurate, and actionable.
 </core_identity>
@@ -437,6 +444,16 @@ function inlineModelOptions(providerId?: string, modelId?: string) {
   }
 }
 
+/** Same, for hover: fast tier, biased to models that explain code well. */
+function hoverModelOptions(providerId?: string, modelId?: string) {
+  try {
+    const resolved = resolveHoverModel(providerId, modelId);
+    return { provider: resolved.provider, model: resolved.model };
+  } catch (err: any) {
+    throw new ModelSelectionError(err?.message ?? "Invalid model selection.");
+  }
+}
+
 /** 400 for a bad client selection, 500 for anything else. */
 function errorStatus(err: unknown): number {
   return err instanceof ModelSelectionError ? 400 : 500;
@@ -647,6 +664,7 @@ class AiController {
     try {
       const configured = new Set<string>(aiService.availableProviders());
       const inlineOk = new Set(inlineModels().map((m) => `${m.provider}/${m.model}`));
+      const hoverOk = new Set(hoverModels().map((m) => `${m.provider}/${m.model}`));
       const byProvider = new Map<string, any>();
 
       for (const m of availableChatModels()) {
@@ -658,13 +676,16 @@ class AiController {
             available: configured.has(m.provider),
             supportsTools: false,
             supportsInline: false,
+            supportsHover: false,
             models: [],
           });
         }
         const entry = byProvider.get(m.provider);
         entry.supportsTools ||= m.supportsTools;
         const supportsInline = inlineOk.has(`${m.provider}/${m.model}`);
+        const supportsHover = hoverOk.has(`${m.provider}/${m.model}`);
         entry.supportsInline ||= supportsInline;
+        entry.supportsHover ||= supportsHover;
         entry.models.push({
           id: m.model,
           name: m.label,
@@ -677,6 +698,8 @@ class AiController {
           supportsTools: m.supportsTools,
           /** False for models too slow to serve ghost text. */
           supportsInline,
+          /** Preferred for hover: fast and good at explaining code. */
+          supportsHover,
         });
       }
 
@@ -880,7 +903,7 @@ You don't need to read a file if it's already provided in context.
       }
 
       const result = await aiService.generate({
-        ...modelOptions(body.providerId, body.modelId),
+        ...hoverModelOptions(body.providerId, body.modelId),
         prompt: `word: ${body.word}\nfilename: ${body.filename ?? "unknown"}\ncontext:\n${body.context ?? ""}`,
         system: MONACO_HOVER_SYSTEM_PROMPT(body.language),
         maxTokens: 1024,
