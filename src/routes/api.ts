@@ -4,6 +4,7 @@ import {
   TerminalSession,
   SFTP,
   AiController,
+  AgentController,
 } from "@/handlers/ctrl";
 
 const router = Router();
@@ -39,5 +40,10 @@ router.post("/hover", AiController.default.hover);
 router.post("/stream", AiController.default.stream);
 router.post("/chat", AiController.default.chat);
 router.post("/chat/ai", AiController.default.chatWithAI);
+
+// Agent
+router.get("/agent/profiles", AgentController.default.profiles);
+router.post("/agent/run", AgentController.default.run);
+router.post("/agent/result", AgentController.default.result);
 
 export default router;

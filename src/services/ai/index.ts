@@ -86,6 +86,55 @@ export interface AiResponse {
   };
 }
 
+// ─── Tool calling ─────────────────────────────────────────────────────────────
+
+/** Providers exposing an OpenAI-compatible `tools` / `tool_calls` wire format. */
+export type ToolCapableProvider = "nvidia" | "groq" | "openrouter";
+
+export interface AiToolDefinition {
+  name: string;
+  description: string;
+  /** JSON Schema for the tool arguments */
+  parameters: Record<string, any>;
+}
+
+export interface AiToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, any>;
+  /** Raw argument string, kept so unparseable output can be surfaced */
+  rawArguments?: string;
+}
+
+export interface AiChatMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string;
+  tool_calls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
+  tool_call_id?: string;
+}
+
+export interface ToolChatOptions {
+  messages: AiChatMessage[];
+  tools?: AiToolDefinition[];
+  toolChoice?: "auto" | "none" | "required";
+  provider?: ToolCapableProvider;
+  model?: string;
+  maxTokens?: number;
+  temperature?: number;
+}
+
+export interface ToolChatResult {
+  text: string;
+  toolCalls: AiToolCall[];
+  provider: ToolCapableProvider;
+  model: string;
+  finishReason?: string;
+}
+
 // ─── Singleton AI Service ─────────────────────────────────────────────────────
 
 /**
@@ -952,6 +1001,165 @@ export class AiService {
       model: body.model,
       fallbackChain: fallbackChain.length ? fallbackChain : undefined,
     };
+  }
+
+  // ── Tool calling (OpenAI-compatible providers only) ───────────────────────
+
+  private _openAiTransport(p: ToolCapableProvider): { url: string; key: string } {
+    switch (p) {
+      case "nvidia":
+        if (!this.nvidiaKey) throw new Error("NVIDIA client not initialised.");
+        return { url: `${this.NVIDIA_BASE_URL}/chat/completions`, key: this.nvidiaKey };
+      case "groq":
+        if (!process.env.GROQ_API_KEY) throw new Error("Groq client not initialised.");
+        return {
+          url: "https://api.groq.com/openai/v1/chat/completions",
+          key: process.env.GROQ_API_KEY,
+        };
+      case "openrouter":
+        if (!process.env.OPEN_ROUTER_KEY) throw new Error("OpenRouter client not initialised.");
+        return {
+          url: "https://openrouter.ai/api/v1/chat/completions",
+          key: process.env.OPEN_ROUTER_KEY,
+        };
+    }
+  }
+
+  /** Providers that support the OpenAI tool-calling wire format. */
+  toolCapableProviders(): ToolCapableProvider[] {
+    return (["nvidia", "groq", "openrouter"] as ToolCapableProvider[]).filter((p) =>
+      this._isAvailable(p),
+    );
+  }
+
+  defaultToolModel(p: ToolCapableProvider): string {
+    return this._modelFor(p);
+  }
+
+  /**
+   * Stream a tool-calling turn. Yields assistant text deltas and returns the
+   * accumulated text plus any tool calls the model requested.
+   *
+   * Unlike `stream()`, this does NOT fall back across providers: a partially
+   * emitted tool call cannot be replayed against a different provider, so the
+   * caller decides whether to retry the whole step.
+   */
+  async *streamWithTools(
+    opts: ToolChatOptions,
+  ): AsyncGenerator<string, ToolChatResult, unknown> {
+    const provider = opts.provider ?? this.toolCapableProviders()[0];
+    if (!provider) throw new Error("No tool-capable AI provider is configured.");
+
+    const { url, key } = this._openAiTransport(provider);
+    const model = opts.model ?? this._modelFor(provider);
+
+    const body: Record<string, any> = {
+      model,
+      messages: opts.messages,
+      max_tokens: opts.maxTokens ?? 2048,
+      temperature: opts.temperature ?? 0.3,
+      stream: true,
+    };
+    if (opts.tools?.length) {
+      body.tools = opts.tools.map((t) => ({
+        type: "function",
+        function: { name: t.name, description: t.description, parameters: t.parameters },
+      }));
+      body.tool_choice = opts.toolChoice ?? "auto";
+    }
+
+    const res: any = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => res.statusText);
+      throw new Error(`${provider} ${res.status}: ${String(detail).slice(0, 300)}`);
+    }
+    if (!res.body) throw new Error(`${provider} returned an empty stream body.`);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let fullText = "";
+    let finishReason: string | undefined;
+    // Tool-call fragments arrive spread across deltas, keyed by their index.
+    const partials = new Map<number, { id: string; name: string; args: string }>();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+          const payload = trimmed.slice(5).trim();
+          if (!payload || payload === "[DONE]") continue;
+
+          let parsed: any;
+          try {
+            parsed = JSON.parse(payload);
+          } catch {
+            continue;
+          }
+
+          const choice = parsed.choices?.[0];
+          if (!choice) continue;
+          if (choice.finish_reason) finishReason = choice.finish_reason;
+
+          const textDelta = choice.delta?.content ?? "";
+          if (textDelta) {
+            fullText += textDelta;
+            yield textDelta;
+          }
+
+          for (const tc of choice.delta?.tool_calls ?? []) {
+            const idx = tc.index ?? 0;
+            const acc = partials.get(idx) ?? { id: "", name: "", args: "" };
+            if (tc.id) acc.id = tc.id;
+            if (tc.function?.name) acc.name += tc.function.name;
+            if (tc.function?.arguments) acc.args += tc.function.arguments;
+            partials.set(idx, acc);
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock?.();
+    }
+
+    const toolCalls: AiToolCall[] = [...partials.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([idx, acc]) => {
+        let args: Record<string, any> = {};
+        try {
+          args = acc.args ? JSON.parse(acc.args) : {};
+        } catch {
+          Logging.dev(
+            `[AI:tools] Unparseable arguments for ${acc.name}: ${acc.args.slice(0, 200)}`,
+            "notice",
+          );
+        }
+        return {
+          id: acc.id || `call_${idx}_${Date.now()}`,
+          name: acc.name,
+          arguments: args,
+          rawArguments: acc.args,
+        };
+      })
+      .filter((c) => !!c.name);
+
+    return { text: fullText, toolCalls, provider, model, finishReason };
   }
 }
 
