@@ -34,6 +34,7 @@ router.post("/files", SFTP.default.handleLoadFilesAndDir);
 
 // AI
 router.get("/ai/providers", AiController.default.providers); 
+router.get("/ai/quota", AiController.default.quotaStatus);
 router.post("/complete", AiController.default.generate);
 router.post("/completions", AiController.default.completions);
 router.post("/hover", AiController.default.hover);

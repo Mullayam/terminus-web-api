@@ -3,6 +3,7 @@ import { Mistral } from "@mistralai/mistralai";
 import Groq from "groq-sdk";
 import { OpenRouter } from "@openrouter/sdk";
 import { Logging } from "@enjoys/express-utils/logger";
+import { quota, QuotaTracker } from "./quota";
 
 export type AiProvider = "gemini" | "mistral" | "groq" | "openrouter" | "nvidia";
 
@@ -34,6 +35,24 @@ export interface AiRequestOptions {
    */
   model?: string;
   /**
+   * Ordered alternates tried when the primary choice errors or is rate
+   * limited. Without this a pinned provider has no escape from a 429.
+   */
+  fallbacks?: Array<{ provider: AiProvider; model?: string }>;
+  /**
+   * Called when a switch happens after chunks were already streamed. The
+   * replacement model restarts the answer from scratch, so whatever reached
+   * the client must be discarded or the two answers render concatenated.
+   */
+  onSwitch?: (info: { from: string; to: string; reason: string }) => void;
+  /**
+   * Summarise older history when the request would not fit the per-minute
+   * token budget. `false` disables it; omitted uses the model's own budget.
+   */
+  compact?: false | { budgetTokens?: number; keepRecent?: number };
+  /** Reports what compaction dropped, so the client can show it. */
+  onCompact?: (info: CompactionInfo) => void;
+  /**
    * Response format hint:
    *  - `"text"` (default) — free-form text
    *  - `"json_object"` — model must return valid JSON
@@ -52,24 +71,14 @@ export interface AiRequestOptions {
   };
 }
 
-export interface ChatModel {
-  id: string;
-  name: string;
-  /** Max context tokens */
-  maxTokens?: number;
-}
-
-export interface ChatProvider {
-  /** Unique provider ID (e.g. "groq", "mistral", "gemini") */
-  id: string;
-  /** Human-readable name */
-  name: string;
-  /** Optional icon URL or icon key */
-  icon?: string;
-  /** Available models for this provider */
-  models: ChatModel[];
-  /** Whether this provider is currently available / healthy */
-  available: boolean;
+export interface CompactionInfo {
+  /** History messages replaced by the summary. */
+  messagesSummarised: number;
+  messagesKept: number;
+  estimatedTokensBefore: number;
+  estimatedTokensAfter: number;
+  budgetTokens: number;
+  summary: string;
 }
 
 export interface AiResponse {
@@ -84,12 +93,16 @@ export interface AiResponse {
     completionTokens?: number;
     totalTokens?: number;
   };
+  /** Remaining budget on the model that served this response. */
+  quota?: ReturnType<typeof quota.usageFor>;
+  /** Present when history was summarised to fit the budget. */
+  compaction?: CompactionInfo;
 }
 
 // ─── Tool calling ─────────────────────────────────────────────────────────────
 
 /** Providers exposing an OpenAI-compatible `tools` / `tool_calls` wire format. */
-export type ToolCapableProvider = "nvidia" | "groq" | "openrouter";
+export type ToolCapableProvider = "nvidia" | "groq" | "openrouter" | "mistral";
 
 export interface AiToolDefinition {
   name: string;
@@ -164,24 +177,16 @@ export class AiService {
   /** NVIDIA NIM is OpenAI-compatible REST — no SDK, only the key is held. */
   private nvidiaKey: string | null = null;
 
+  // Defaults used only when a caller pins a provider without a model. Each must
+  // stay in MODEL_CATALOG; the previous Groq and OpenRouter slugs were retired
+  // upstream and 404'd.
   private readonly GEMINI_MODEL = "gemini-2.5-flash";
   private readonly MISTRAL_MODEL = "mistral-small-latest";
-  private readonly GROQ_MODEL = "llama-3.3-70b-versatile";
-  private readonly OPENROUTER_MODEL = "qwen/qwen3-coder:free";
-  private readonly NVIDIA_MODEL = "openai/gpt-oss-120b";
+  private readonly GROQ_MODEL = "openai/gpt-oss-120b";
+  private readonly OPENROUTER_MODEL = "cohere/north-mini-code:free";
+  private readonly NVIDIA_MODEL = "openai/gpt-oss-20b";
   private readonly NVIDIA_BASE_URL =
     process.env.NVIDIA_BASE_URL ?? "https://integrate.api.nvidia.com/v1";
-
-  /** Catalog exposed to the UI. IDs must match the NVIDIA build catalog exactly. */
-  private readonly NVIDIA_MODELS: ChatModel[] = [
-    { id: "openai/gpt-oss-120b", name: "GPT-OSS 120B", maxTokens: 131072 },
-    { id: "nvidia/nemotron-3-ultra-550b-a55b", name: "Nemotron 3 Ultra 550B A55B", maxTokens: 131072 },
-    { id: "deepseek-ai/deepseek-v4-flash", name: "DeepSeek V4 Flash", maxTokens: 131072 },
-    { id: "zai/glm-5.2", name: "GLM-5.2", maxTokens: 131072 },
-    { id: "nvidia/nemotron-3.5-lightning-30b-a3b", name: "Nemotron 3.5 Lightning 30B A3B", maxTokens: 131072 },
-    { id: "minimaxai/minimax-m3", name: "MiniMax M3", maxTokens: 131072 },
-    { id: "google/gemma-4-31b-it", name: "Gemma 4 31B", maxTokens: 32768 },
-  ];
 
   /** Default provider order */
   private readonly SEQUENCE: AiProvider[] = ["nvidia", "mistral", "groq", "openrouter", "gemini"];
@@ -246,7 +251,6 @@ export class AiService {
       if (!this._isAvailable(options.provider)) {
         throw new Error(`Provider "${options.provider}" is not configured.`);
       }
-      return this._callProvider(options.provider, options);
     }
     return this._generateWithFallback(options);
   }
@@ -261,31 +265,55 @@ export class AiService {
   async *stream(
     options: AiRequestOptions,
   ): AsyncGenerator<string, AiResponse, unknown> {
-    const providers = options.provider
-      ? [options.provider]
-      : this.SEQUENCE.filter((p) => this._isAvailable(p));
+    const compacted = await this._maybeCompact(options);
+    options = compacted.options;
 
-    if (providers.length === 0)
+    const candidates = this._candidates(options);
+
+    if (candidates.length === 0)
       throw new Error("No AI providers are configured.");
 
     const fallbackChain: AiResponse["fallbackChain"] = [];
+    const est = this._estimateTokens(options);
 
-    for (const provider of providers) {
+    for (let i = 0; i < candidates.length; i++) {
+      const { provider, model } = candidates[i];
+      // A blocked model is only reached once everything ready has failed, so
+      // waiting it out beats returning an error to the user.
+      const verdict = quota.check(provider, model, est);
+      if (!verdict.ok) {
+        if (verdict.retryAfterMs > 60_000) {
+          fallbackChain.push({
+            provider,
+            error: `${verdict.reason}, free in ${Math.ceil(verdict.retryAfterMs / 1000)}s`,
+          });
+          continue;
+        }
+        Logging.dev(
+          `[AI:stream] all models throttled, waiting ${Math.ceil(verdict.retryAfterMs / 1000)}s for ${this._key(provider, model)}`,
+          "notice",
+        );
+        await new Promise((r) => setTimeout(r, verdict.retryAfterMs));
+      }
+
+      const attempt: AiRequestOptions = { ...options, provider, model };
+      let emitted = 0;
+      quota.record(provider, model, est);
       try {
-        Logging.dev(`[AI:stream] Trying provider: ${provider}`);
+        Logging.dev(`[AI:stream] Trying ${this._key(provider, model)}`);
 
         let innerGen: AsyncGenerator<string, AiResponse, unknown>;
 
         if (provider === "gemini") {
-          innerGen = this._streamGemini(options, fallbackChain);
+          innerGen = this._streamGemini(attempt, fallbackChain);
         } else if (provider === "groq") {
-          innerGen = this._streamGroq(options, fallbackChain);
+          innerGen = this._streamGroq(attempt, fallbackChain);
         } else if (provider === "openrouter") {
-          innerGen = this._streamOpenRouter(options, fallbackChain);
+          innerGen = this._streamOpenRouter(attempt, fallbackChain);
         } else if (provider === "nvidia") {
-          innerGen = this._streamNvidia(options, fallbackChain);
+          innerGen = this._streamNvidia(attempt, fallbackChain);
         } else {
-          innerGen = this._streamMistral(options, fallbackChain);
+          innerGen = this._streamMistral(attempt, fallbackChain);
         }
 
         // Manually iterate so errors are reliably caught in this try/catch
@@ -297,17 +325,32 @@ export class AiService {
             finalResponse.fallbackChain = fallbackChain.length
               ? fallbackChain
               : undefined;
+            finalResponse.quota = quota.usageFor(provider, model);
+            finalResponse.compaction = compacted.info;
             return finalResponse;
           }
+          emitted++;
           yield result.value;
         }
       } catch (err: any) {
         const msg = err?.message ?? String(err);
+        this._noteRateLimit(provider, model, err);
         Logging.dev(
-          `[AI:stream] ${provider} failed (${msg}), switching to next provider…`,
+          `[AI:stream] ${this._key(provider, model)} failed (${msg}), switching…`,
           "notice",
         );
         fallbackChain.push({ provider, error: msg });
+
+        // The next model answers from the top, so anything already delivered is
+        // now orphaned text the caller has to drop.
+        const next = candidates[i + 1];
+        if (emitted > 0 && next) {
+          options.onSwitch?.({
+            from: this._key(provider, model),
+            to: this._key(next.provider, next.model),
+            reason: msg,
+          });
+        }
       }
     }
     throw new Error(
@@ -320,60 +363,188 @@ export class AiService {
     return this.SEQUENCE.filter((p) => this._isAvailable(p));
   }
 
-  /** Returns detailed provider info including models and availability */
-  getProviderDetails(): ChatProvider[] {
-    return [
-      {
-        id: "nvidia",
-        name: "NVIDIA NIM",
-        icon: "nvidia",
-        available: !!this.nvidiaKey,
-        models: this.NVIDIA_MODELS,
-      },
-      {
-        id: "mistral",
-        name: "Mistral AI",
-        icon: "mistral",
-        available: !!this.mistral,
-        models: [
-          { id: this.MISTRAL_MODEL, name: "Mistral Large", maxTokens: 32768 },
-        ],
-      },
-      {
-        id: "openrouter",
-        name: "OpenRouter",
-        icon: "openrouter",
-        available: !!this.openrouter,
-        models: [
-          { id: "openai/gpt-4o", name: "GPT-4o", maxTokens: 128000 },
-          { id: "openai/gpt-4o-mini", name: "GPT-4o Mini", maxTokens: 128000 },
-          { id: "anthropic/claude-sonnet-4", name: "Claude Sonnet 4", maxTokens: 200000 },
-          { id: "anthropic/claude-3.5-sonnet", name: "Claude 3.5 Sonnet", maxTokens: 200000 },
-          { id: "google/gemini-2.0-flash-001", name: "Gemini 2.0 Flash", maxTokens: 1048576 },
-          { id: "meta-llama/llama-3.3-70b-instruct", name: "Llama 3.3 70B", maxTokens: 131072 },
-          { id: "deepseek/deepseek-chat-v3-0324", name: "DeepSeek V3", maxTokens: 131072 },
-          { id: "qwen/qwen-2.5-coder-32b-instruct", name: "Qwen 2.5 Coder 32B", maxTokens: 32768 },
-        ],
-      },
-      {
-        id: "groq",
-        name: "Groq",
-        icon: "groq",
-        available: !!this.groq,
-        models: [
-          { id: this.GROQ_MODEL, name: "Llama 3.3 70B", maxTokens: 32768 },
-        ],
-      },
-      {
-        id: "gemini",
-        name: "Google Gemini",
-        icon: "gemini",
-        available: !!this.gemini,
-        models: [
-          { id: this.GEMINI_MODEL, name: "Gemini 2.0 Flash", maxTokens: 8192 },
-        ],
-      },
-    ];
+  // ── Rate-limit cooldowns ──────────────────────────────────────────────────
+
+  private _key(provider: AiProvider, model?: string): string {
+    return `${provider}/${model ?? "default"}`;
+  }
+
+  /** Milliseconds until this model is usable again, or 0 if it is usable now. */
+  cooldownRemaining(provider: AiProvider, model?: string, estTokens = 0): number {
+    return quota.check(provider, model, estTokens).retryAfterMs;
+  }
+
+  /** Every model currently blocked, with the wait left on each. */
+  activeCooldowns(): Array<{ target: string; msRemaining: number; reason: string }> {
+    return quota
+      .snapshot()
+      .filter((s) => s.blockedForMs > 0)
+      .map((s) => ({ target: s.target, msRemaining: s.blockedForMs, reason: "rate limited" }))
+      .sort((a, b) => a.msRemaining - b.msRemaining);
+  }
+
+  /** Per-model request and token usage against the known free-tier ceilings. */
+  quotaUsage() {
+    return quota.snapshot();
+  }
+
+  /** Prompt size plus the reserved completion, which is what providers meter. */
+  private _estimateTokens(opts: AiRequestOptions): number {
+    const chars =
+      (opts.system?.length ?? 0) +
+      opts.prompt.length +
+      (opts.history ?? []).reduce((s, m) => s + m.content.length, 0);
+    return QuotaTracker.estimate(chars, opts.maxTokens ?? 2048);
+  }
+
+  /**
+   * Replaces older history with a summary when the turn would not fit the
+   * budget. A 7k-token system prompt against Groq's 8000 TPM leaves almost
+   * nothing for history, so without this every multi-turn chat 429s.
+   *
+   * Returns the original options when nothing needed dropping.
+   */
+  private async _maybeCompact(
+    options: AiRequestOptions,
+  ): Promise<{ options: AiRequestOptions; info?: CompactionInfo }> {
+    if (options.compact === false) return { options };
+
+    const keepRecent = options.compact?.keepRecent ?? 4;
+    const history = options.history ?? [];
+    if (history.length <= keepRecent) return { options };
+
+    // Budget follows the requested model, not the first that happens to have
+    // room: a pinned model should be made to fit rather than silently swapped.
+    const target = options.provider
+      ? { provider: options.provider, model: options.model }
+      : this._candidates({ ...options, compact: false })[0];
+    const budget =
+      options.compact?.budgetTokens ??
+      quota.limitsFor(target?.provider ?? "groq", target?.model).tokensPerMinute ??
+      8000;
+
+    const before = this._estimateTokens(options);
+    if (before <= budget) return { options };
+
+    const older = history.slice(0, -keepRecent);
+    const kept = history.slice(-keepRecent);
+
+    let summary: string;
+    try {
+      const res = await this.generate({
+        prompt: older.map((m) => `${m.role}: ${m.content}`).join("\n\n"),
+        system:
+          "Summarise the conversation below for use as context in a terminal assistant. " +
+          "Keep hostnames, paths, ports, commands run, errors seen, and decisions made. " +
+          "Drop pleasantries. Output plain prose under 150 words, no preamble.",
+        maxTokens: 300,
+        temperature: 0.2,
+        // Guards against a summarisation call recursing into another one.
+        compact: false,
+      });
+      summary = res.text.trim();
+    } catch {
+      // Losing the old turns entirely still beats failing the request.
+      summary = "(earlier conversation omitted: summarisation unavailable)";
+    }
+
+    const compacted: AiRequestOptions = {
+      ...options,
+      history: [
+        { role: "user", content: `Summary of earlier conversation:\n${summary}` },
+        ...kept,
+      ],
+    };
+
+    const info: CompactionInfo = {
+      messagesSummarised: older.length,
+      messagesKept: kept.length,
+      estimatedTokensBefore: before,
+      estimatedTokensAfter: this._estimateTokens(compacted),
+      budgetTokens: budget,
+      summary,
+    };
+
+    Logging.dev(
+      `[AI:compact] ${older.length} messages → summary, ${before} → ${info.estimatedTokensAfter} tokens (budget ${budget})`,
+      "notice",
+    );
+    options.onCompact?.(info);
+    return { options: compacted, info };
+  }
+
+  /**
+   * Records a cooldown if `err` is a rate limit. Providers report the wait
+   * differently, so this reads the `retry-after` header, then the "try again in
+   * 35.8275s" text Groq embeds in the body, then falls back to 60s.
+   */
+  private _noteRateLimit(provider: AiProvider, model: string | undefined, err: any): boolean {
+    const msg = String(err?.message ?? err ?? "");
+    const status = err?.status ?? err?.statusCode ?? err?.response?.status;
+    const isRateLimit =
+      status === 429 || msg.includes("429") || /rate.?limit/i.test(msg);
+    if (!isRateLimit) return false;
+
+    const headerRetry = Number(
+      err?.headers?.["retry-after"] ?? err?.response?.headers?.get?.("retry-after"),
+    );
+    const bodyRetry = Number(msg.match(/try again in ([\d.]+)\s*s/i)?.[1]);
+    const seconds = Number.isFinite(headerRetry) && headerRetry > 0
+      ? headerRetry
+      : Number.isFinite(bodyRetry) && bodyRetry > 0
+        ? bodyRetry
+        : 60;
+
+    // Small pad: retrying on the exact boundary tends to 429 again.
+    quota.penalize(provider, model, Math.ceil(seconds * 1000) + 500);
+    return true;
+  }
+
+  /**
+   * Ordered attempts for a request: the caller's choice first, then its
+   * fallbacks, then the default sequence. Models whose budget cannot cover this
+   * request are moved to the back rather than dropped, so a fully throttled set
+   * still tries the one that frees up soonest instead of failing outright.
+   */
+  private _candidates(
+    options: AiRequestOptions,
+  ): Array<{ provider: AiProvider; model?: string }> {
+    const seen = new Set<string>();
+    const ordered: Array<{ provider: AiProvider; model?: string }> = [];
+    const push = (provider: AiProvider, model?: string) => {
+      if (!this._isAvailable(provider)) return;
+      const k = this._key(provider, model);
+      if (seen.has(k)) return;
+      seen.add(k);
+      ordered.push({ provider, model });
+    };
+
+    if (options.provider) push(options.provider, options.model);
+    for (const f of options.fallbacks ?? []) push(f.provider, f.model);
+    if (!options.provider) for (const p of this.SEQUENCE) push(p, undefined);
+
+    const est = this._estimateTokens(options);
+    const verdicts = new Map(
+      ordered.map((c) => [this._key(c.provider, c.model), quota.check(c.provider, c.model, est)]),
+    );
+
+    const ready = ordered.filter((c) => verdicts.get(this._key(c.provider, c.model))!.ok);
+    const blocked = ordered
+      .filter((c) => !verdicts.get(this._key(c.provider, c.model))!.ok)
+      .sort(
+        (a, b) =>
+          verdicts.get(this._key(a.provider, a.model))!.retryAfterMs -
+          verdicts.get(this._key(b.provider, b.model))!.retryAfterMs,
+      );
+
+    for (const c of blocked) {
+      const v = verdicts.get(this._key(c.provider, c.model))!;
+      Logging.dev(
+        `[AI:quota] skipping ${this._key(c.provider, c.model)}: ${v.reason} (free in ${Math.ceil(v.retryAfterMs / 1000)}s)`,
+      );
+    }
+
+    return [...ready, ...blocked];
   }
 
   // ── Internal: sequential fallback with context ────────────────────────────
@@ -381,23 +552,42 @@ export class AiService {
   private async _generateWithFallback(
     options: AiRequestOptions,
   ): Promise<AiResponse> {
-    const candidates = this.SEQUENCE.filter((p) => this._isAvailable(p));
+    const candidates = this._candidates(options);
     if (candidates.length === 0)
       throw new Error("No AI providers are configured.");
 
     const fallbackChain: AiResponse["fallbackChain"] = [];
+    const est = this._estimateTokens(options);
 
-    for (const provider of candidates) {
+    for (const { provider, model } of candidates) {
+      const verdict = quota.check(provider, model, est);
+      if (!verdict.ok) {
+        if (verdict.retryAfterMs > 60_000) {
+          fallbackChain.push({
+            provider,
+            error: `${verdict.reason}, free in ${Math.ceil(verdict.retryAfterMs / 1000)}s`,
+          });
+          continue;
+        }
+        Logging.dev(
+          `[AI] all models throttled, waiting ${Math.ceil(verdict.retryAfterMs / 1000)}s for ${this._key(provider, model)}`,
+          "notice",
+        );
+        await new Promise((r) => setTimeout(r, verdict.retryAfterMs));
+      }
+
+      quota.record(provider, model, est);
       try {
-        Logging.dev(`[AI] Trying provider: ${provider}`);
-        const result = await this._callProvider(provider, options);
+        Logging.dev(`[AI] Trying ${this._key(provider, model)}`);
+        const result = await this._callProvider(provider, { ...options, provider, model });
         // Attach fallback info if we had to switch
         if (fallbackChain.length) result.fallbackChain = fallbackChain;
         return result;
       } catch (err: any) {
         const msg = err?.message ?? String(err);
+        this._noteRateLimit(provider, model, err);
         Logging.dev(
-          `[AI] ${provider} failed (${msg}), switching context to next provider…`,
+          `[AI] ${this._key(provider, model)} failed (${msg}), switching…`,
           "notice",
         );
         fallbackChain.push({ provider, error: msg });
@@ -1022,12 +1212,18 @@ export class AiService {
           url: "https://openrouter.ai/api/v1/chat/completions",
           key: process.env.OPEN_ROUTER_KEY,
         };
+      case "mistral":
+        if (!process.env.MISTRAL_API_KEY) throw new Error("Mistral client not initialised.");
+        return {
+          url: "https://api.mistral.ai/v1/chat/completions",
+          key: process.env.MISTRAL_API_KEY,
+        };
     }
   }
 
   /** Providers that support the OpenAI tool-calling wire format. */
   toolCapableProviders(): ToolCapableProvider[] {
-    return (["nvidia", "groq", "openrouter"] as ToolCapableProvider[]).filter((p) =>
+    return (["nvidia", "groq", "openrouter", "mistral"] as ToolCapableProvider[]).filter((p) =>
       this._isAvailable(p),
     );
   }

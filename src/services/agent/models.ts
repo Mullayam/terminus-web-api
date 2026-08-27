@@ -100,9 +100,29 @@ export interface ModelEntry {
  * `latencyMs` is measured, not estimated: each entry was timed issuing the same
  * tool-calling turn. Selection sorts by it, which is why Groq leads every tier —
  * it served the same weights 4-45x faster than NVIDIA.
+ *
+ * `free` reflects the quota the configured key actually gets. Groq's free tier
+ * bills nothing and meters per model (1000 req/day, 8000 tok/min each), so it is
+ * both the fastest and the largest free budget here. OpenRouter's `:free` slugs
+ * share one 50 req/day account-wide cap until $10 of credits is purchased, which
+ * raises it to 1000/day — so adding more `:free` slugs buys no extra capacity.
  */
 export const MODEL_CATALOG: ModelEntry[] = [
   // ── Groq ──────────────────────────────────────────────────────────────────
+  {
+    provider: "groq",
+    model: "openai/gpt-oss-safeguard-20b",
+    label: "GPT-OSS Safeguard 20B (Groq)",
+    description:
+      "Policy-tuned sibling of the 20B and the fastest model measured. Prefer it for permission, secret, and hardening review, where the answer is a judgement against a rule.",
+    bestFor: ["security", "linux"],
+    tiers: ["fast"],
+    complexity: "simple",
+    latencyMs: 213,
+    contextWindow: 131072,
+    free: true,
+    supportsTools: true,
+  },
   {
     provider: "groq",
     model: "openai/gpt-oss-20b",
@@ -114,7 +134,7 @@ export const MODEL_CATALOG: ModelEntry[] = [
     complexity: "simple",
     latencyMs: 569,
     contextWindow: 131072,
-    free: false,
+    free: true,
     supportsTools: true,
   },
   {
@@ -137,7 +157,7 @@ export const MODEL_CATALOG: ModelEntry[] = [
     complexity: "hard",
     latencyMs: 605,
     contextWindow: 131072,
-    free: false,
+    free: true,
     supportsTools: true,
   },
   {
@@ -151,7 +171,7 @@ export const MODEL_CATALOG: ModelEntry[] = [
     complexity: "hard",
     latencyMs: 572,
     contextWindow: 131072,
-    free: false,
+    free: true,
     supportsTools: true,
   },
 
@@ -181,6 +201,20 @@ export const MODEL_CATALOG: ModelEntry[] = [
     complexity: "moderate",
     latencyMs: 1615,
     contextWindow: 1000000,
+    free: true,
+    supportsTools: true,
+  },
+  {
+    provider: "openrouter",
+    model: "dots-studio/dots-3-note-preview:free",
+    label: "Dots 3 Note Preview (free)",
+    description:
+      "Fastest free tool-caller, with a 512K window. OpenRouter lists it as going away 2026-09-30, so treat it as temporary capacity.",
+    bestFor: ["general", "linux", "summarization", "long-context"],
+    tiers: ["fast"],
+    complexity: "moderate",
+    latencyMs: 1586,
+    contextWindow: 512000,
     free: true,
     supportsTools: true,
   },
@@ -241,6 +275,20 @@ export const MODEL_CATALOG: ModelEntry[] = [
   },
   {
     provider: "openrouter",
+    model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+    label: "Nemotron 3 Nano Omni 30B Reasoning (free)",
+    description:
+      "Small free reasoning model with a 256K window. Slow for its size, so reserve it for thinking-tier work the faster free models get wrong.",
+    bestFor: ["reasoning", "debugging"],
+    tiers: ["thinking"],
+    complexity: "moderate",
+    latencyMs: 4961,
+    contextWindow: 256000,
+    free: true,
+    supportsTools: true,
+  },
+  {
+    provider: "openrouter",
     model: "nvidia/nemotron-3-super-120b-a12b:free",
     label: "Nemotron 3 Super 120B (free)",
     description: "Free mid-large reasoning model. Slowest of the working free options.",
@@ -269,11 +317,52 @@ export const MODEL_CATALOG: ModelEntry[] = [
     supportsTools: true,
   },
 
-  // ── Chat-only providers ───────────────────────────────────────────────────
-  // No OpenAI-format tool calling, so these never serve agent runs. They are
-  // valid for completions, hover, and chat.
+  // ── Chat-only models ──────────────────────────────────────────────────────
+  // These specific models answer in prose instead of emitting tool calls, so
+  // they never serve agent runs. They are valid for completions, hover, and
+  // chat. This is per-model, not per-provider.
+  {    provider: "groq",
+    model: "groq/compound-mini",
+    label: "Compound Mini (Groq)",
+    description:
+      "Groq's agentic system with built-in web search, wrapped as a chat model. Fast, and useful when an answer needs facts newer than the model weights.",
+    bestFor: ["general", "linux", "explanation"],
+    tiers: ["fast"],
+    complexity: "simple",
+    latencyMs: 1058,
+    contextWindow: 131072,
+    free: true,
+    supportsTools: false,
+  },
   {
-    provider: "mistral",
+    provider: "nvidia",
+    model: "nvidia/nemotron-3-nano-30b-a3b",
+    label: "Nemotron 3 Nano 30B (NVIDIA)",
+    description:
+      "Answers in prose rather than calling tools, but keeps a 1M window and stays terse. Use for chat over very large pasted logs.",
+    bestFor: ["general", "linux", "long-context", "summarization"],
+    tiers: ["fast"],
+    complexity: "simple",
+    latencyMs: 1535,
+    contextWindow: 1000000,
+    free: false,
+    supportsTools: false,
+  },
+  {
+    provider: "groq",
+    model: "groq/compound",
+    label: "Compound (Groq)",
+    description:
+      "Larger sibling of Compound Mini, same built-in search. Use when the question needs more depth than the mini gives.",
+    bestFor: ["general", "linux", "reasoning", "explanation"],
+    tiers: ["fast"],
+    complexity: "moderate",
+    latencyMs: 2065,
+    contextWindow: 131072,
+    free: true,
+    supportsTools: false,
+  },
+  {    provider: "mistral",
     model: "mistral-small-latest",
     label: "Mistral Small",
     description:
@@ -282,9 +371,69 @@ export const MODEL_CATALOG: ModelEntry[] = [
     tiers: ["fast"],
     complexity: "simple",
     latencyMs: 740,
-    contextWindow: 32768,
+    contextWindow: 262144,
     free: false,
-    supportsTools: false,
+    supportsTools: true,
+  },
+
+  // ── Mistral ───────────────────────────────────────────────────────────────
+  // Measured on the live API: all four continued a cursor completion, answered
+  // a hover question, and emitted a correct `run_command` tool call.
+  {
+    provider: "mistral",
+    model: "codestral-latest",
+    label: "Codestral",
+    description:
+      "Code-tuned and the fastest Mistral entry. Continues from the cursor without markdown fences, which makes it the best fit for inline completion.",
+    bestFor: ["coding", "debugging", "explanation"],
+    tiers: ["fast", "thinking"],
+    complexity: "moderate",
+    latencyMs: 583,
+    contextWindow: 256000,
+    free: false,
+    supportsTools: true,
+  },
+  {
+    provider: "mistral",
+    model: "mistral-code-fim-latest",
+    label: "Mistral Code FIM",
+    description:
+      "Fill-in-middle variant. Same clean cursor continuation as Codestral and the only catalog model built for insertion between existing code.",
+    bestFor: ["coding"],
+    tiers: ["fast"],
+    complexity: "moderate",
+    latencyMs: 740,
+    contextWindow: 256000,
+    free: false,
+    supportsTools: true,
+  },
+  {
+    provider: "mistral",
+    model: "ministral-3b-latest",
+    label: "Ministral 3B",
+    description:
+      "Smallest and quickest Mistral model. Wraps output in markdown fences and was inaccurate on a hover question, so prefer it for cheap chat rather than completion or hover.",
+    bestFor: ["general"],
+    tiers: ["fast"],
+    complexity: "simple",
+    latencyMs: 519,
+    contextWindow: 131072,
+    free: false,
+    supportsTools: true,
+  },
+  {
+    provider: "mistral",
+    model: "magistral-small-latest",
+    label: "Magistral Small",
+    description:
+      "Reasoning-tuned with a 262k window. Rewrites a whole function instead of continuing from the cursor, so use it for chat and analysis, not completion.",
+    bestFor: ["reasoning", "planning", "explanation", "long-context"],
+    tiers: ["fast", "thinking"],
+    complexity: "hard",
+    latencyMs: 709,
+    contextWindow: 262144,
+    free: false,
+    supportsTools: true,
   },
   {
     provider: "gemini",
@@ -296,8 +445,8 @@ export const MODEL_CATALOG: ModelEntry[] = [
     tiers: ["fast"],
     complexity: "moderate",
     latencyMs: 1431,
-    contextWindow: 8192,
-    free: false,
+    contextWindow: 1048576,
+    free: true,
     supportsTools: false,
   },
 ];
@@ -305,17 +454,36 @@ export const MODEL_CATALOG: ModelEntry[] = [
 /**
  * Models that were tested and rejected. Kept so the catalog documents why they
  * are absent rather than silently omitting them.
+ *
+ * A 429 on an OpenRouter `:free` slug is usually the account-wide daily cap
+ * (`limit_source: openrouter_free_tier_daily`), not a verdict on the model —
+ * check `GET /api/v1/key` before adding one here.
  */
 export const REJECTED_MODELS: Array<{ provider: string; model: string; reason: string }> = [
   { provider: "groq", model: "llama-3.3-70b-versatile", reason: "404 — retired from Groq" },
-  { provider: "groq", model: "groq/compound", reason: "Does not support tool calling" },
+  {
+    provider: "groq",
+    model: "qwen/qwen3.6-27b",
+    reason: "Dumps chain-of-thought into `content` (8/8 prompts); never populates `reasoning`",
+  },
   { provider: "openrouter", model: "qwen/qwen3-coder:free", reason: "Retired; paid slug only" },
-  { provider: "openrouter", model: "google/gemma-4-31b-it:free", reason: "429 — upstream rate limited" },
-  { provider: "openrouter", model: "poolside/laguna-xs-2.1:free", reason: "429 — upstream rate limited" },
+  {
+    provider: "openrouter",
+    model: "openrouter/free",
+    reason: "Auto-router; reached nemotron-3.5-content-safety, which answered 'User Safety: safe'",
+  },
+  { provider: "openrouter", model: "google/gemma-4-31b-it:free", reason: "Untested — 429 was the account-wide free-tier daily cap, not the model" },
+  { provider: "openrouter", model: "google/gemma-4-26b-a4b-it:free", reason: "Untested — 429 was the account-wide free-tier daily cap, not the model" },
+  { provider: "openrouter", model: "minimax/minimax-m2.7:free", reason: "Untested — 429 was the account-wide free-tier daily cap, not the model" },
+  { provider: "openrouter", model: "poolside/laguna-xs-2.1:free", reason: "Untested — 429 was the account-wide free-tier daily cap, not the model" },
+  { provider: "openrouter", model: "poolside/laguna-s-2.1:free", reason: "Works, but 8s per turn — slower than the 550B" },
   { provider: "openrouter", model: "thinkingmachines/inkling-small:free", reason: "403 — account gated" },
+  { provider: "openrouter", model: "thinkingmachines/inkling:free", reason: "403 — account gated" },
   { provider: "nvidia", model: "openai/gpt-oss-120b", reason: "28s latency and intermittent 502s" },
+  { provider: "nvidia", model: "moonshotai/kimi-k3", reason: "502 — upstream request failed" },
   { provider: "nvidia", model: "deepseek-ai/deepseek-v4-flash", reason: "410 Gone — use -0731 suffix" },
   { provider: "nvidia", model: "zai/glm-5.2", reason: "Not present in the NVIDIA catalog" },
+  { provider: "nvidia", model: "google/gemma-4-31b-it", reason: "No response within 20s" },
 ];
 
 /** A catalog entry known to be tool-capable, narrowed for the agent router. */
@@ -335,6 +503,21 @@ export function availableModels(): ToolModelEntry[] {
 export function availableChatModels(): ModelEntry[] {
   const configured = new Set<string>(aiService.availableProviders());
   return MODEL_CATALOG.filter((m) => configured.has(m.provider));
+}
+
+/**
+ * Alternates for a chat request, fastest first, excluding the primary choice.
+ *
+ * Free-tier limits are per model, not per provider, so a Groq TPM overrun must
+ * be able to land on another Groq model before leaving the provider.
+ */
+export function chatFallbacks(
+  primary?: { provider: AiProvider; model?: string },
+): Array<{ provider: AiProvider; model: string }> {
+  return availableChatModels()
+    .filter((m) => !(primary && m.provider === primary.provider && m.model === primary.model))
+    .sort((a, b) => a.latencyMs - b.latencyMs)
+    .map((m) => ({ provider: m.provider, model: m.model }));
 }
 
 export function findModel(provider: string, model: string): ModelEntry | undefined {
