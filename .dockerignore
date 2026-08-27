@@ -1,0 +1,23 @@
+# Secrets — must never be baked into an image layer
+.env
+.env.*
+
+# Host-built dependencies: darwin/arm64 native binaries would overwrite the
+# linux-x64 ones installed inside the image
+node_modules
+
+# Local embedded store; production mounts a volume at /data
+.terminus-store
+
+# Build output, regenerated inside the image
+build
+
+.git
+.gitignore
+.vscode
+docs
+*.md
+!code-completion.md
+Dockerfile
+.dockerignore
+build.sh
