@@ -4,7 +4,7 @@ import Groq from "groq-sdk";
 import { OpenRouter } from "@openrouter/sdk";
 import { Logging } from "@enjoys/express-utils/logger";
 
-export type AiProvider = "gemini" | "mistral" | "groq" | "openrouter";
+export type AiProvider = "gemini" | "mistral" | "groq" | "openrouter" | "nvidia";
 
 export interface AiMessage {
   role: "user" | "assistant" | "system";
@@ -93,16 +93,17 @@ export interface AiResponse {
  *
  * **Automatic context-switching fallback** (default behaviour):
  *   When `options.provider` is NOT set, the service tries providers in order:
- *     1. Mistral    → `mistral-large-latest`
- *     2. OpenRouter → `openai/gpt-4o`
+ *     1. NVIDIA NIM → `openai/gpt-oss-120b`
+ *     2. Mistral    → `mistral-small-latest`
  *     3. Groq       → `llama-3.3-70b-versatile`
- *     4. Gemini     → `gemini-2.0-flash`
+ *     4. OpenRouter → `qwen/qwen3-coder:free`
+ *     5. Gemini     → `gemini-2.5-flash`
  *   On ANY error from a provider it immediately switches to the next one,
  *   carrying the full conversation context with it. The `fallbackChain`
  *   field in the response documents which switches happened and why.
  *
  * Environment variables required in `.env`:
- *   GEMINI_API_KEY, MISTRAL_API_KEY, GROQ_API_KEY, OPEN_ROUTER_KEY
+ *   NVIDIA_API_KEY, GEMINI_API_KEY, MISTRAL_API_KEY, GROQ_API_KEY, OPEN_ROUTER_KEY
  */
 export class AiService {
   private static _instance: AiService;
@@ -111,14 +112,30 @@ export class AiService {
   private mistral: Mistral | null = null;
   private groq: Groq | null = null;
   private openrouter: OpenRouter | null = null;
+  /** NVIDIA NIM is OpenAI-compatible REST — no SDK, only the key is held. */
+  private nvidiaKey: string | null = null;
 
   private readonly GEMINI_MODEL = "gemini-2.5-flash";
   private readonly MISTRAL_MODEL = "mistral-small-latest";
   private readonly GROQ_MODEL = "llama-3.3-70b-versatile";
   private readonly OPENROUTER_MODEL = "qwen/qwen3-coder:free";
+  private readonly NVIDIA_MODEL = "openai/gpt-oss-120b";
+  private readonly NVIDIA_BASE_URL =
+    process.env.NVIDIA_BASE_URL ?? "https://integrate.api.nvidia.com/v1";
+
+  /** Catalog exposed to the UI. IDs must match the NVIDIA build catalog exactly. */
+  private readonly NVIDIA_MODELS: ChatModel[] = [
+    { id: "openai/gpt-oss-120b", name: "GPT-OSS 120B", maxTokens: 131072 },
+    { id: "nvidia/nemotron-3-ultra-550b-a55b", name: "Nemotron 3 Ultra 550B A55B", maxTokens: 131072 },
+    { id: "deepseek-ai/deepseek-v4-flash", name: "DeepSeek V4 Flash", maxTokens: 131072 },
+    { id: "zai/glm-5.2", name: "GLM-5.2", maxTokens: 131072 },
+    { id: "nvidia/nemotron-3.5-lightning-30b-a3b", name: "Nemotron 3.5 Lightning 30B A3B", maxTokens: 131072 },
+    { id: "minimaxai/minimax-m3", name: "MiniMax M3", maxTokens: 131072 },
+    { id: "google/gemma-4-31b-it", name: "Gemma 4 31B", maxTokens: 32768 },
+  ];
 
   /** Default provider order */
-  private readonly SEQUENCE: AiProvider[] = ["mistral", "openrouter", "groq", "gemini"];
+  private readonly SEQUENCE: AiProvider[] = ["nvidia", "mistral", "groq", "openrouter", "gemini"];
 
   private constructor() {
     this._initClients();
@@ -136,6 +153,12 @@ export class AiService {
     const mk = process.env.MISTRAL_API_KEY;
     const qk = process.env.GROQ_API_KEY;
     const ork = process.env.OPEN_ROUTER_KEY;
+    const nvk = process.env.NVIDIA_API_KEY;
+
+    if (nvk) {
+      this.nvidiaKey = nvk;
+      Logging.dev("[AI] NVIDIA NIM  ✓");
+    } else Logging.dev("[AI] NVIDIA NIM  ✗  (NVIDIA_API_KEY missing)", "notice");
 
     if (gk) {
       this.gemini = new GoogleGenerativeAI(gk);
@@ -210,6 +233,8 @@ export class AiService {
           innerGen = this._streamGroq(options, fallbackChain);
         } else if (provider === "openrouter") {
           innerGen = this._streamOpenRouter(options, fallbackChain);
+        } else if (provider === "nvidia") {
+          innerGen = this._streamNvidia(options, fallbackChain);
         } else {
           innerGen = this._streamMistral(options, fallbackChain);
         }
@@ -249,6 +274,13 @@ export class AiService {
   /** Returns detailed provider info including models and availability */
   getProviderDetails(): ChatProvider[] {
     return [
+      {
+        id: "nvidia",
+        name: "NVIDIA NIM",
+        icon: "nvidia",
+        available: !!this.nvidiaKey,
+        models: this.NVIDIA_MODELS,
+      },
       {
         id: "mistral",
         name: "Mistral AI",
@@ -344,6 +376,8 @@ export class AiService {
         return this._callGroq(opts);
       case "openrouter":
         return this._callOpenRouter(opts);
+      case "nvidia":
+        return this._callNvidia(opts);
       default:
         throw new Error(`Unknown provider: ${provider}`);
     }
@@ -355,6 +389,7 @@ export class AiService {
       case "mistral":    return !!this.mistral;
       case "groq":       return !!this.groq;
       case "openrouter": return !!this.openrouter;
+      case "nvidia":     return !!this.nvidiaKey;
       default:           return false;
     }
   }
@@ -365,6 +400,7 @@ export class AiService {
       case "mistral":    return this.MISTRAL_MODEL;
       case "groq":       return this.GROQ_MODEL;
       case "openrouter": return this.OPENROUTER_MODEL;
+      case "nvidia":     return this.NVIDIA_MODEL;
       default:           return this.OPENROUTER_MODEL;
     }
   }
@@ -778,6 +814,142 @@ export class AiService {
       text: fullText,
       provider: "openrouter",
       model: modelId,
+      fallbackChain: fallbackChain.length ? fallbackChain : undefined,
+    };
+  }
+
+  // ── NVIDIA NIM (OpenAI-compatible REST) ────────────────────────────────────
+
+  private _nvidiaBody(opts: AiRequestOptions, stream: boolean): Record<string, any> {
+    const {
+      prompt,
+      system,
+      history = [],
+      maxTokens = 2048,
+      temperature = 0.7,
+    } = opts;
+
+    const messages: Array<{ role: string; content: string }> = [];
+    if (system) messages.push({ role: "system", content: system });
+    for (const m of history) messages.push({ role: m.role, content: m.content });
+    messages.push({ role: "user", content: prompt });
+
+    const body: Record<string, any> = {
+      model: opts.model ?? this.NVIDIA_MODEL,
+      messages,
+      max_tokens: maxTokens,
+      temperature,
+      stream,
+    };
+    if (opts.responseFormat && opts.responseFormat !== "text") {
+      body.response_format =
+        opts.responseFormat === "json_schema" && opts.responseSchema
+          ? {
+              type: "json_schema",
+              json_schema: {
+                name: opts.responseSchema.name,
+                description: opts.responseSchema.description,
+                schema: opts.responseSchema.schema,
+                strict: opts.responseSchema.strict ?? false,
+              },
+            }
+          : { type: "json_object" };
+    }
+    return body;
+  }
+
+  private async _nvidiaFetch(body: Record<string, any>, stream: boolean): Promise<any> {
+    if (!this.nvidiaKey) throw new Error("NVIDIA client not initialised.");
+
+    const res: any = await fetch(`${this.NVIDIA_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.nvidiaKey}`,
+        "Content-Type": "application/json",
+        Accept: stream ? "text/event-stream" : "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => res.statusText);
+      throw new Error(`NVIDIA NIM ${res.status}: ${String(detail).slice(0, 300)}`);
+    }
+    return res;
+  }
+
+  private async _callNvidia(opts: AiRequestOptions): Promise<AiResponse> {
+    const body = this._nvidiaBody(opts, false);
+    const res = await this._nvidiaFetch(body, false);
+    const json: any = await res.json();
+
+    const message = json.choices?.[0]?.message;
+    // Reasoning models (gpt-oss, Nemotron) put chain-of-thought in reasoning_content.
+    const text: string = message?.content ?? "";
+
+    return {
+      text,
+      provider: "nvidia",
+      model: body.model,
+      usage: {
+        promptTokens: json.usage?.prompt_tokens,
+        completionTokens: json.usage?.completion_tokens,
+        totalTokens: json.usage?.total_tokens,
+      },
+    };
+  }
+
+  private async *_streamNvidia(
+    opts: AiRequestOptions,
+    fallbackChain: AiResponse["fallbackChain"] = [],
+  ): AsyncGenerator<string, AiResponse, unknown> {
+    const body = this._nvidiaBody(opts, true);
+    const res = await this._nvidiaFetch(body, true);
+    if (!res.body) throw new Error("NVIDIA NIM returned an empty stream body.");
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let fullText = "";
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+
+          const payload = trimmed.slice(5).trim();
+          if (!payload || payload === "[DONE]") continue;
+
+          let parsed: any;
+          try {
+            parsed = JSON.parse(payload);
+          } catch {
+            continue;
+          }
+
+          const delta = parsed.choices?.[0]?.delta?.content ?? "";
+          if (delta) {
+            fullText += delta;
+            yield delta;
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock?.();
+    }
+
+    return {
+      text: fullText,
+      provider: "nvidia",
+      model: body.model,
       fallbackChain: fallbackChain.length ? fallbackChain : undefined,
     };
   }
