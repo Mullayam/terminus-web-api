@@ -36,6 +36,9 @@ ENV NODE_ENV=production
 # Embedded RocksDB store. Mount a volume here or the completion cache is lost
 # on every restart and each cold start pays full model latency.
 ENV STORE_PATH=/data/store
+# SFTP staging (uploads/downloads/zips). Must be writable by USER bun; /app is
+# root-owned so this lives on the mounted /data volume, not the image.
+ENV STORAGE_PATH=/data/storage
 
 COPY --from=deps --chown=bun:bun /app/node_modules ./node_modules
 COPY --from=builder --chown=bun:bun /app/build ./build
@@ -49,6 +52,8 @@ ENV CODEIUM_BINARY_PATH=/app/codeium/language_server
 
 # Ownership is set at COPY time above, so only /data needs a chown here — a
 # recursive chown of /app would duplicate node_modules + the binary in a new layer.
+# The app creates STORAGE_PATH (/data/storage) itself at boot; /data is bun-owned
+# so that mkdir succeeds (unlike /app, which is root-owned).
 RUN mkdir -p /data/store && chown -R bun:bun /data
 VOLUME ["/data"]
 

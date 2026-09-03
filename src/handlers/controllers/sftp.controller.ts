@@ -13,6 +13,7 @@ import * as tar from "tar";
 import archiver from "archiver";
 import progress from "progress-stream";
 import utils from "@/utils";
+import { STORAGE_PATH } from "@/utils/constant";
 import type SFTPClient from "ssh2-sftp-client";
 import type { Socket } from "socket.io";
 
@@ -42,7 +43,7 @@ const getSftpSocket = (req: Request) => {
     if (!socket) return undefined;
     return socket;
 };
-const uploadPath = join(process.cwd(), "storage");
+const uploadPath = STORAGE_PATH;
 export const ABORT_CONTROLLER_MAP = new Map<string, AbortController>();
 
 /** Staging dir for resumable chunk uploads (the client→server hop). */

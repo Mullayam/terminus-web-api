@@ -1,3 +1,14 @@
+import { join } from "path";
+
+/**
+ * Root dir for SFTP staging: uploads, downloads and zip extraction.
+ *
+ * Must be writable by the runtime user. In Docker the process runs as an
+ * unprivileged user and `/app` is root-owned, so this points at the mounted
+ * `/data` volume there (see Dockerfile). Falls back to `<cwd>/storage` locally.
+ */
+export const STORAGE_PATH = process.env.STORAGE_PATH ?? join(process.cwd(), "storage");
+
 const config = {
     NODE_ENV: String(process.env.NODE_ENV),
     PORT: Number(process.env.PORT) || 7145,
