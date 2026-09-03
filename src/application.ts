@@ -15,6 +15,7 @@ import fileUpload from 'express-fileupload';
 import ApiRoutes from './routes/web'
 import { ApplyMiddleware } from './middlewares/all.middlewares';
 import { __CONFIG__ } from './utils/constant';
+import { codeiumService } from './services/codeium';
 Logging.setLocalAppName("TERMINUS");
 const { ExceptionHandler, UnhandledRoutes } = createHandlers();
 
@@ -121,6 +122,9 @@ class AppServer {
         try {
            
             this.InitServer()
+            // Spawn the Codeium companion (download → launch → port discovery).
+            // Failures land in a degraded state, they never block server startup.
+            void codeiumService.init()
             return AppServer.App
 
         } catch (error: any) {
@@ -131,12 +135,12 @@ class AppServer {
         process.on('SIGINT', () => {
             Logging.dev("Manually Shutting Down", "notice")
 
-            process.exit(1);
+            void codeiumService.shutdown().finally(() => process.exit(1));
         })
         process.on('SIGTERM', () => {
             Logging.dev("Error Occured", "error")
 
-            process.exit(1);
+            void codeiumService.shutdown().finally(() => process.exit(1));
         })
         process.on('uncaughtException', (err, origin) => {
             Logging.dev(`Uncaught Exception ${err.name} ` + err.message + err.stack, "error")

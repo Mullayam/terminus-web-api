@@ -19,6 +19,15 @@ RUN bun install
 COPY . .
 RUN bun run build
 
+# ---- Codeium language server (baked in, linux/amd64) ----
+# Fetched at build time so there is no ~170 MB download in the startup path (§9).
+# Pinned version — only the 1.x line is verified against the proxy. Remove this
+# stage (and the COPY/ENV below) if the Codeium feature is not used.
+FROM debian:bookworm-slim AS codeium
+ARG CODEIUM_VERSION=1.20.8
+ADD https://github.com/Exafunction/codeium/releases/download/language-server-v${CODEIUM_VERSION}/language_server_linux_x64.gz /tmp/ls.gz
+RUN gunzip /tmp/ls.gz && chmod +x /tmp/ls
+
 # ---- Production ----
 FROM oven/bun:1 AS runner
 WORKDIR /app
@@ -28,15 +37,19 @@ ENV NODE_ENV=production
 # on every restart and each cold start pays full model latency.
 ENV STORE_PATH=/data/store
 
-COPY --from=deps /app/node_modules ./node_modules
-COPY --from=builder /app/build ./build
-COPY --from=builder /app/package.json ./package.json
-COPY --from=builder /app/claude-sonet.4.6.txt ./claude-sonet.4.6.txt
-COPY --from=builder /app/code-completion.md ./code-completion.md
+COPY --from=deps --chown=bun:bun /app/node_modules ./node_modules
+COPY --from=builder --chown=bun:bun /app/build ./build
+COPY --from=builder --chown=bun:bun /app/package.json ./package.json
+COPY --from=builder --chown=bun:bun /app/claude-sonet.4.6.txt ./claude-sonet.4.6.txt
+COPY --from=builder --chown=bun:bun /app/code-completion.md ./code-completion.md
 
-# Docker seeds a fresh named volume from the image directory, ownership
-# included, so chown here is what makes the mount writable for uid 1000.
-RUN mkdir -p /data/store && chown -R bun:bun /data /app
+# Baked language server; CODEIUM_BINARY_PATH makes the app skip the boot download.
+COPY --from=codeium --chown=bun:bun /tmp/ls /app/codeium/language_server
+ENV CODEIUM_BINARY_PATH=/app/codeium/language_server
+
+# Ownership is set at COPY time above, so only /data needs a chown here — a
+# recursive chown of /app would duplicate node_modules + the binary in a new layer.
+RUN mkdir -p /data/store && chown -R bun:bun /data
 VOLUME ["/data"]
 
 USER bun

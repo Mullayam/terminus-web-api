@@ -37,7 +37,7 @@ docker run -d \
   --name $CONTAINER_NAME \
   --platform $PLATFORM \
   --restart unless-stopped \
-  --memory="1g" \
+  --memory="2g" \
   -p $PORT:$PORT \
   --env-file .env \
   -e STORE_PATH=$STORE_PATH \

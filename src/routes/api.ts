@@ -5,6 +5,7 @@ import {
   SFTP,
   AiController,
   AgentController,
+  CodeiumController,
 } from "@/handlers/ctrl";
 
 const router = Router();
@@ -47,5 +48,12 @@ router.get("/agent/profiles", AgentController.default.profiles);
 router.get("/agent/models", AgentController.default.models);
 router.post("/agent/run", AgentController.default.run);
 router.post("/agent/result", AgentController.default.result);
+
+// Codeium inline completions
+router.post("/codeium/complete", CodeiumController.default.complete);
+router.post("/codeium/accept", CodeiumController.default.accept);
+router.get("/codeium/auth/url", CodeiumController.default.authUrl);
+router.get("/codeium/auth/status", CodeiumController.default.authStatus);
+router.post("/codeium/auth", CodeiumController.default.auth);
 
 export default router;

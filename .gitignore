@@ -26,3 +26,12 @@ dist-ssr
 
 # Embedded RocksDB store (local dev; production uses a Docker volume)
 .terminus-store/
+
+# Codeium language-server binary + runtime dirs. The ~170 MB binary is
+# downloaded on demand and cached; never commit it. Bake it into the image
+# via CODEIUM_BINARY_PATH for production instead.
+codeium-bin/
+.codeium/
+**/language_server
+**/language_server.exe
+*.gz

@@ -23,7 +23,7 @@ declare module "@enjoys/store" {
 
   export interface IKVStore<T = unknown> {
     get(key: string): Promise<T | null>;
-    put(key: string, value: T): Promise<void>;
+    set(key: string, value: T): Promise<void>;
     del(key: string): Promise<void>;
   }
 
