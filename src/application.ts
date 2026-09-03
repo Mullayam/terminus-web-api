@@ -16,6 +16,7 @@ import ApiRoutes from './routes/web'
 import { ApplyMiddleware } from './middlewares/all.middlewares';
 import { __CONFIG__ } from './utils/constant';
 import { codeiumService } from './services/codeium';
+import { keepAliveService } from './services/keepalive';
 Logging.setLocalAppName("TERMINUS");
 const { ExceptionHandler, UnhandledRoutes } = createHandlers();
 
@@ -125,6 +126,8 @@ class AppServer {
             // Spawn the Codeium companion (download → launch → port discovery).
             // Failures land in a degraded state, they never block server startup.
             void codeiumService.init()
+            // Keep the Render LSP hub warm so it doesn't idle-spin-down.
+            keepAliveService.start()
             return AppServer.App
 
         } catch (error: any) {
@@ -135,11 +138,13 @@ class AppServer {
         process.on('SIGINT', () => {
             Logging.dev("Manually Shutting Down", "notice")
 
+            keepAliveService.stop()
             void codeiumService.shutdown().finally(() => process.exit(1));
         })
         process.on('SIGTERM', () => {
             Logging.dev("Error Occured", "error")
 
+            keepAliveService.stop()
             void codeiumService.shutdown().finally(() => process.exit(1));
         })
         process.on('uncaughtException', (err, origin) => {

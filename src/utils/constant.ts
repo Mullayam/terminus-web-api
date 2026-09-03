@@ -39,5 +39,17 @@ const config = {
         /** Byte-offset range conversion (§6.2) — off until verified against real traffic. */
         ENABLE_RANGE_CONVERSION: process.env.CODEIUM_ENABLE_RANGE_CONVERSION === "true",
     },
+    KEEPALIVE: {
+        /** Master switch. When false the pinger never starts. Defaults on in production. */
+        ENABLED: process.env.KEEPALIVE_ENABLED
+            ? process.env.KEEPALIVE_ENABLED === "true"
+            : process.env.NODE_ENV === "production",
+        /** Render service to keep warm — it spins down after ~15 min of inactivity. */
+        URL: process.env.KEEPALIVE_URL ?? "https://monaco-lsp-hub.onrender.com",
+        /** Ping cadence in minutes. Keep below 15 so Render never idles out. */
+        INTERVAL_MINUTES: Number(process.env.KEEPALIVE_INTERVAL_MINUTES ?? 30),
+        /** Abort a hung request so a cold start never stacks pings. */
+        TIMEOUT_MS: Number(process.env.KEEPALIVE_TIMEOUT_MS ?? 30_000),
+    },
 }
 export const __CONFIG__ = Object.freeze(config);
