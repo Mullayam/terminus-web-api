@@ -13,9 +13,18 @@ STORE_PATH="/data/store"
 # On Apple Silicon this runs under emulation.
 PLATFORM="linux/amd64"
 
+# Optional flags. --no-cache forces a clean rebuild (ignores Docker layer cache).
+NO_CACHE=""
+for arg in "$@"; do
+    case "$arg" in
+        --no-cache) NO_CACHE="--no-cache" ;;
+        *) echo "Unknown option: $arg" >&2; exit 1 ;;
+    esac
+done
+
 # Build the Docker image
 echo "Building Docker image..."
-docker build --platform $PLATFORM -t $IMAGE_NAME .
+docker build $NO_CACHE --platform $PLATFORM -t $IMAGE_NAME .
 
 # Create the store volume if it does not exist yet
 if ! docker volume inspect "$STORE_VOLUME" >/dev/null 2>&1; then
