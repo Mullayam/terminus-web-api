@@ -3,3 +3,4 @@ export * as Authentication from "./controllers/auth.controller";
 export * as SFTP from "./controllers/sftp.controller";
 export * as TerminalSession from "./controllers/terminalSession.controller";
 export * as AiController from "./controllers/ai.controller";
+export * as AgentController from "./controllers/agent.controller";

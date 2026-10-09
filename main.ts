@@ -18,7 +18,7 @@ function main() {
             res.set('x-timestamp', Date.now())
         }
     }
-    
+
     app.use(bootstrap.express.static('public', options))
 }
 

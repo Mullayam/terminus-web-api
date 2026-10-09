@@ -71,9 +71,9 @@ class SFTP_Service {
             this.sockets.set(sftpSessionId, socket);
 
             Logging.dev(`[SFTP:ns] Client connected: ${sftpSessionId}`);
-          
+
             this.emitSftpEvent(sftpSessionId, socket);
-          
+
             return client;
         } catch (err: any) {
             Logging.dev(`SFTP Connection Error [${sftpSessionId}]: ${err.message}`, 'error');
