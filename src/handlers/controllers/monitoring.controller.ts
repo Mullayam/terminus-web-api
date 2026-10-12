@@ -1,4 +1,5 @@
 import type { Response, Request } from 'express'
+import { codeiumService } from '../../services/codeium'
 
 class MonitoringController {
     async health(req: Request, res: Response) {
@@ -6,7 +7,11 @@ class MonitoringController {
             res.json({
                 status: true,
                 message: '',
-                result: {}
+                result: {
+                    // A dead language server is otherwise indistinguishable from
+                    // "the model had no suggestion" (§9).
+                    codeium: codeiumService.health(),
+                }
             })
 
         } catch (err: any) {

@@ -5,6 +5,7 @@ import {
   SFTP,
   AiController,
   AgentController,
+  CodeiumController,
 } from "@/handlers/ctrl";
 
 const router = Router();
@@ -34,6 +35,7 @@ router.post("/files", SFTP.default.handleLoadFilesAndDir);
 
 // AI
 router.get("/ai/providers", AiController.default.providers); 
+router.get("/ai/quota", AiController.default.quotaStatus);
 router.post("/complete", AiController.default.generate);
 router.post("/completions", AiController.default.completions);
 router.post("/hover", AiController.default.hover);
@@ -42,8 +44,21 @@ router.post("/chat", AiController.default.chat);
 router.post("/chat/ai", AiController.default.chatWithAI);
 
 // AI Agent harness
-router.get("/ai/agent/models", AgentController.default.models);
+router.get("/ai/agent/models", AgentController.default.harnessModels);
 router.get("/ai/agent/settings", AgentController.default.getSettings);
 router.put("/ai/agent/settings", AgentController.default.updateSettings);
+
+// Agent
+router.get("/agent/profiles", AgentController.default.profiles);
+router.get("/agent/models", AgentController.default.models);
+router.post("/agent/run", AgentController.default.run);
+router.post("/agent/result", AgentController.default.result);
+
+// Codeium inline completions
+router.post("/codeium/complete", CodeiumController.default.complete);
+router.post("/codeium/accept", CodeiumController.default.accept);
+router.get("/codeium/auth/url", CodeiumController.default.authUrl);
+router.get("/codeium/auth/status", CodeiumController.default.authStatus);
+router.post("/codeium/auth", CodeiumController.default.auth);
 
 export default router;

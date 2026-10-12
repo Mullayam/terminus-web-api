@@ -10,6 +10,7 @@ import { SocketEventConstants } from "./events";
 import { Sftp_Service } from "../sftp";
 import { FileOperationPayload, EditFilePayload } from "../../types/file-upload";
 import { parseSSHConfig } from "./parse-ssh-config";
+import { STORAGE_PATH } from "../../utils/constant";
 
 const E = SocketEventConstants;
 
@@ -287,7 +288,7 @@ export class SFTPNamespace {
             try {
                 const { path } = payload;
                 if (!path) return socket.emit(E.ERROR, "Invalid path");
-                const localDownloadPath = join(process.cwd(), "storage", "downloads");
+                const localDownloadPath = join(STORAGE_PATH, "downloads");
                 if (!fs.existsSync(localDownloadPath)) {
                     fs.mkdirSync(localDownloadPath, { recursive: true });
                 }
@@ -379,7 +380,7 @@ export class SFTPNamespace {
                 if (!dirPath) {
                     throw new Error("Invalid directory path");
                 }
-                const localZipPath = join(process.cwd(), "storage");
+                const localZipPath = STORAGE_PATH;
                 await this.getSftp().get(dirPath, localZipPath);
                 // Step 2: Extract the ZIP file
                 const zip = new AdmZip(localZipPath);
