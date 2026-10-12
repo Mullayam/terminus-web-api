@@ -15,6 +15,7 @@ import fileUpload from 'express-fileupload';
 import ApiRoutes from './routes/web'
 import { ApplyMiddleware } from './middlewares/all.middlewares';
 import { __CONFIG__ } from './utils/constant';
+import { createMcpRouter } from './services/mcp';
 import { codeiumService } from './services/codeium';
 import { keepAliveService } from './services/keepalive';
 Logging.setLocalAppName("TERMINUS");
@@ -71,6 +72,7 @@ class AppServer {
     private RegisterRoutes() {
         Logging.dev("Registering Routes")
         Logging.dev("Routes Registered")
+        AppServer.App.use("/mcp", createMcpRouter());
         AppServer.App.use(ApiRoutes);
         AppServer.App.use(UnhandledRoutes);
         RouteResolver.Mapper(AppServer.App as any, { listEndpoints: true, })
@@ -121,7 +123,7 @@ class AppServer {
     InitializeApplication() {
         Logging.dev("Application Dependencies Injected")
         try {
-           
+
             this.InitServer()
             // Spawn the Codeium companion (download → launch → port discovery).
             // Failures land in a degraded state, they never block server startup.

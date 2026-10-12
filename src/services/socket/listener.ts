@@ -417,7 +417,7 @@ export class SocketListener extends EventEmitter {
 
         stream.on("close", () => conn.end());
 
-        this.emit("shell-ready", { sessionId, stream, socket });
+        this.emit("shell-ready", { sessionId, stream, socket, conn });
 
         socket.on(E.SSH_EMIT_INPUT, (input: string) => {
             if (input != null) stream.write(input);

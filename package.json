@@ -43,6 +43,8 @@
     "@enjoys/store": "^1.0.0",
     "@google/generative-ai": "^0.24.1",
     "@mistralai/mistralai": "^1.14.1",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@opencode-ai/sdk": "^1.18.35",
     "@openrouter/sdk": "^0.9.11",
     "@socket.io/redis-adapter": "^8.3.0",
     "adm-zip": "^0.5.16",
@@ -61,6 +63,7 @@
     "import": "^0.0.6",
     "morgan": "^1.10.0",
     "node-ssh": "^13.2.1",
+    "opencode-ai": "^1.18.35",
     "progress-stream": "^2.0.0",
     "redis": "^4.7.0",
     "reflect-metadata": "^0.2.2",
@@ -74,7 +77,8 @@
     "vscode-jsonrpc": "^8.2.1",
     "vscode-languageserver-protocol": "^3.17.5",
     "vscode-ws-jsonrpc": "^3.5.0",
-    "ws": "^8.19.0"
+    "ws": "^8.19.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",

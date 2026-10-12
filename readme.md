@@ -1,4 +1,3 @@
-
 # Terminal Collaboration Platform - Backend
 
 A secure, real-time terminal collaboration platform enabling shared SFTP sessions, multi-user terminal access, and AI-assisted development.
@@ -27,6 +26,13 @@ A secure, real-time terminal collaboration platform enabling shared SFTP session
   - Error detection and resolution
   - Best practices recommendations
 
+- **AI Agent Harness**
+  - Agentic AI (opencode) that operates the live SSH session via MCP tools
+  - Runs commands in the real PTY — visible to every collaborator
+  - Two-tier safety gate: destructive commands are hard-blocked behind confirmation
+  - Per-session auto mode, model selection, and a stop control
+  - Multi-provider (Groq, OpenRouter, NVIDIA NIM, Mistral, Gemini)
+
 - **Key Vault Management**
   - Secure credential storage
   - SSH key management
@@ -40,7 +46,7 @@ A secure, real-time terminal collaboration platform enabling shared SFTP session
   - WebSocket (Socket.io)
   - Redis for session management
 
-- **Security:** 
+- **Security:**
   - HTTPS/WSS protocols
   - Rate limiting
 
@@ -59,23 +65,27 @@ Python >= 3.8 (for AI components)
 ## 🔧 Installation
 
 1. Clone the repository:
+
 ```bash
 git clone https://github.com/Mullayam/terminus-web
 cd terminus-web
 ```
 
 2. Install dependencies:
+
 ```bash
 npm install
 ```
 
 3. Set up environment variables:
+
 ```bash
 cp .env.example .env
 # Edit .env with your configuration
 ```
 
 4. Start the server:
+
 ```bash
 npm run dev     # Development
 npm run start   # Production
@@ -97,7 +107,26 @@ REDIS_URL=""
 JWT_SECRET=your_jwt_secret
 ENCRYPTION_KEY=your_encryption_key
 FRONTEND_URL=http://localhost:5173
+
+# AI Agent Harness (set at least one provider key)
+GROQ_API_KEY=
+OPENROUTER_API_KEY=
+NVIDIA_API_KEY=
+GEMINI_API_KEY=
+MISTRAL_API_KEY=
+# Optional: override the default agent model, e.g. groq/openai/gpt-oss-120b
+OPENCODE_MODEL=
+# Optional: connect to an external `opencode serve` instead of spawning one
+OPENCODE_BASE_URL=
+# Optional: use the full claude-sonet.4.6.txt prompt (true) instead of the lean one (default false)
+OPENCODE_FULL_SYSTEM_PROMPT=
 ```
+
+> **Note on rate limits:** opencode's own baseline request is ~11k tokens (its system
+> prompt + tool schemas). The harness injects a **condensed** agent prompt by default to
+> keep requests small; set `OPENCODE_FULL_SYSTEM_PROMPT=true` for the full prompt. Either
+> way, free provider tiers with a low tokens-per-minute cap (e.g. Groq free = 8000 TPM)
+> cannot fit opencode — use a Dev/paid tier or an OpenRouter key with more headroom.
 
 ## 🔐 Security Considerations
 
@@ -110,20 +139,95 @@ FRONTEND_URL=http://localhost:5173
 
 ## 🌐 API Documentation
 
-
-
-
 ### SFTP Operations
 
 ```bash
 POST /api/sftp/upload
-GET /api/sftp/download 
+GET /api/sftp/download
 ```
 
 ## LOCAL TERMINAL SOCKET EVENTS
- - `@@SSH_EMIT_RESIZE` : When is Resize the xTerm
- - `@@SEND_COMMAND` :  Use in `term.write()` function to send command to Backend to write cmd to PTY.
- - `@@RECIEVE_COMMAND` : Use in `term.onData()` or  `term.data()` to recive the output from Backend.
+
+- `@@SSH_EMIT_RESIZE` : When is Resize the xTerm
+- `@@SEND_COMMAND` : Use in `term.write()` function to send command to Backend to write cmd to PTY.
+- `@@RECIEVE_COMMAND` : Use in `term.onData()` or `term.data()` to recive the output from Backend.
+
+---
+
+## AI Agent Harness
+
+An agentic AI layer that operates the user's **live SSH session**. The agent (opencode)
+reaches a generic, transport-agnostic tool core through an MCP server hosted inside this
+backend, and streams tagged progress back to the xterm UI.
+
+### Layers
+
+```
+src/services/ai-harness/
+  tools/         generic tool core (run_command, read_file, write_file, list_dir, stat_path, list_sessions)
+  models.ts      typed provider/model catalog (mirrors GET /api/ai/providers)
+  danger.ts      command safety classifier (safe | confirm | blocked)
+  agent-settings per-session auto mode + model
+  agent-bus      routes events to /ai-agent sockets, awaits confirmations
+  session-registry   reuses the live SSH client + PTY stream (never opens a new connection)
+  opencode/      spawns opencode, injects the system prompt, drives sessions
+src/services/mcp/   the MCP server (Streamable HTTP) mounted at /mcp
+```
+
+### Flow
+
+1. UI connects to the `/ai-agent` Socket.IO namespace and emits a prompt.
+2. The harness creates/reuses an opencode session and injects the active `sessionId`.
+3. opencode calls the terminus MCP tools at `/mcp`.
+4. `run_command` runs **in the live PTY** (visible to every collaborator), capturing output.
+5. Tagged events stream back; dangerous commands pause for confirmation.
+
+### HTTP endpoints
+
+```bash
+GET  /api/ai/agent/models                 # provider + model catalog, and which providers are configured
+GET  /api/ai/agent/settings?sessionId=ID  # current { autoMode, model } for a session
+PUT  /api/ai/agent/settings               # { sessionId, autoMode?, model? }
+```
+
+### Socket events (`/ai-agent` namespace)
+
+**Client → Server**
+
+- `@@AI_AGENT_PROMPT` — `{ sessionId, prompt, model? }`
+- `@@AI_AGENT_CONFIRM_REPLY` — `{ confirmId, approved }`
+- `@@AI_AGENT_ABORT` — `{ sessionId }` (stops execution: interrupts the PTY, cancels pending confirmations, aborts the agent)
+
+**Server → Client**
+
+- `@@AI_AGENT_EVENT` — `{ kind, tag, sessionId, payload }` where `tag` ∈ `[MESSAGE] [COMMAND] [EXECUTE_TASK] [DANGEROUS] [OUTPUT] [DONE] [ERROR]`
+- `@@AI_AGENT_CONFIRM_REQUEST` — `{ confirmId, sessionId, command, reason, level }`
+
+### Safety policy
+
+| Tier | Examples | Behavior |
+|------|----------|----------|
+| `blocked` | `rm -rf`, `rm -r`, `find -delete`, `mkfs`, `dd of=/dev/*`, `DROP`/`TRUNCATE`, `git reset --hard`, force push, fork bombs | **Always** require explicit confirmation — never auto-approved, even in auto mode |
+| `confirm` | reboot, recursive `chmod`/`chown`, `systemctl stop/disable`, docker/k8s/terraform teardown, firewall flush, `apt autoremove` | Require confirmation unless **auto mode** is enabled for the session |
+| `safe` | everything else | Runs immediately |
+
+Auto mode is per-session and toggled via `PUT /api/ai/agent/settings`.
+
+### Providers & models
+
+Supports **Groq**, **OpenRouter**, **NVIDIA NIM**, **Mistral**, and **Gemini** (same catalog
+as `GET /api/ai/providers`). Groq and OpenRouter are native to opencode; NVIDIA NIM, Mistral,
+and Gemini are wired through the OpenAI-compatible provider shape. Keys are read from `.env`
+via `src/utils/constant.ts`; the harness refuses to start if no provider key is set.
+
+### Runtime notes
+
+- The agent **never opens a new SSH connection** — it reuses the live terminal session's
+  client and PTY stream from the socket layer.
+- The `opencode` CLI is a project dependency (`opencode-ai`), so it resolves under
+  `npm run dev` / `npm run start`. Set `OPENCODE_BASE_URL` to use an external server instead.
+- Gemini and a few models have no tool support; the default-model picker prefers a
+  tool-capable model so the agent can call MCP tools.
 
 ---
 
@@ -147,11 +251,11 @@ When multiple users share a single SSH shell (PTY), two race conditions emerge:
 
 Every socket gets a permission level that controls PTY access:
 
-| Permission | Name       | Can Read Output | Can Write to PTY | Subject to Lock |
-|------------|------------|:---------------:|:-----------------:|:---------------:|
-| `400`      | Read-only  | ✅              | ❌                | N/A             |
-| `700`      | Write      | ✅              | ✅                | ✅              |
-| `777`      | Admin      | ✅              | ✅                | ❌ (immune)     |
+| Permission | Name      | Can Read Output | Can Write to PTY | Subject to Lock |
+| ---------- | --------- | :-------------: | :--------------: | :-------------: |
+| `400`      | Read-only |       ✅        |        ❌        |       N/A       |
+| `700`      | Write     |       ✅        |        ✅        |       ✅        |
+| `777`      | Admin     |       ✅        |        ✅        |   ❌ (immune)   |
 
 - New joiners default to `400` (read-only). The admin must explicitly promote them to `700`.
 - Only one socket can be `777` (the session creator). Promotion to `777` is blocked.
@@ -173,6 +277,7 @@ User A starts typing
 ```
 
 Key behaviors:
+
 - `777` (admin) **bypasses** auto-lock — they can always type, and their typing does **not**
   create an auto-lock.
 - `400` users are rejected before the lock is even checked (read-only).
@@ -210,13 +315,14 @@ collab.registerAll(socket);
 
 // Inside each handler:
 socket.on(COLLAB_JOIN_TERMINAL, (payload: JoinTerminalPayload) => {
-    const sessionId = payload.sessionId; // from payload, not closure
-    // ...
+  const sessionId = payload.sessionId; // from payload, not closure
+  // ...
 });
 ```
 
 A `socketSessions` map (`socketId → Set<sessionId>`) tracks which sessions each socket has
 joined. This enables:
+
 - **Input routing** without `sessionId` in every keystroke payload (`findSessionForSocket()`)
 - **Disconnect cleanup** that iterates all sessions the socket belonged to
 - **Kicked-user rejoin** — their new socket already has all listeners; they just emit
@@ -282,11 +388,9 @@ This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md
 
 ## 👥 Authors
 
--  [Mullayam ](https://github.com/Mullayam)
-
+- [Mullayam ](https://github.com/Mullayam)
 
 ## 🙏 Acknowledgments
-
 
 - Socket.io team for real-time capabilities
 - OpenAI for AI integration support

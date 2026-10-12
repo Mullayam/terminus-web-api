@@ -10,7 +10,10 @@ import { LSPNamespace } from "./lsp-namespace";
 import { AiNamespace } from "./ai-namespace";
 import { SFTPNamespace } from "./sftp-namespace";
 import { CollaborativeTerminal } from "./collaborative-terminal";
- 
+import { AgentSessionRegistry } from "../ai-harness/session-registry";
+import { AgentHarness } from "../ai-harness/opencode/harness";
+import { AiAgentNamespace } from "../ai-harness/ai-agent-namespace";
+
 
 let socketIo: Server<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, any>;
 
@@ -55,13 +58,17 @@ export const InitSocketConnection = async (server: HttpServer) => {
     collabSubClient as any,
   );
 
-  listner.on("shell-ready", ({ sessionId, stream, socket: adminSocket }) => {
+  AgentHarness.configure(`http://localhost:${__CONFIG__.PORT}/mcp`);
+
+  listner.on("shell-ready", ({ sessionId, stream, socket: adminSocket, conn }) => {
     collab.createSession(sessionId, adminSocket.id);
     collab.bindStream(sessionId, stream);
+    AgentSessionRegistry.register(sessionId, conn, stream);
 
     // Clean up collab state when the PTY stream closes
     stream.on("close", () => {
       collab.destroySession(sessionId);
+      AgentSessionRegistry.unregister(sessionId);
     });
   });
 
@@ -86,6 +93,9 @@ export const InitSocketConnection = async (server: HttpServer) => {
   });
   io.of("/sftp").on("connection", (socket) => {
     new SFTPNamespace(socket, redisClient as any);
+  });
+  io.of("/ai-agent").on("connection", (socket) => {
+    new AiAgentNamespace(socket);
   });
   socketIo = io;
   return io;

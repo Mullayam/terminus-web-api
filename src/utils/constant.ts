@@ -1,5 +1,12 @@
 import { join } from "path";
 
+const optional = (value?: string): string | undefined => {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : undefined;
+};
+
+const asBool = (value?: string): boolean => value?.trim().toLowerCase() === "true";
+
 /**
  * Root dir for SFTP staging: uploads, downloads and zip extraction.
  *
@@ -18,6 +25,14 @@ const config = {
     FRONTEND_URL: process.env.FRONTEND_URL
         ? process.env.FRONTEND_URL.split(',').map(u => u.trim()).filter(Boolean)
         : ["*"],
+    GROQ_API_KEY: optional(process.env.GROQ_API_KEY),
+    OPENROUTER_API_KEY: optional(process.env.OPENROUTER_API_KEY),
+    NVIDIA_API_KEY: optional(process.env.NVIDIA_API_KEY),
+    GEMINI_API_KEY: optional(process.env.GEMINI_API_KEY),
+    MISTRAL_API_KEY: optional(process.env.MISTRAL_API_KEY),
+    OPENCODE_MODEL: optional(process.env.OPENCODE_MODEL),
+    OPENCODE_BASE_URL: optional(process.env.OPENCODE_BASE_URL),
+    OPENCODE_FULL_SYSTEM_PROMPT: asBool(process.env.OPENCODE_FULL_SYSTEM_PROMPT),
     CODEIUM: {
         /** Master switch. When false the companion never spawns and completions return empty. */
         ENABLED: process.env.CODEIUM_ENABLED === "true",

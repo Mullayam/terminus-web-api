@@ -43,6 +43,11 @@ router.post("/stream", AiController.default.stream);
 router.post("/chat", AiController.default.chat);
 router.post("/chat/ai", AiController.default.chatWithAI);
 
+// AI Agent harness
+router.get("/ai/agent/models", AgentController.default.harnessModels);
+router.get("/ai/agent/settings", AgentController.default.getSettings);
+router.put("/ai/agent/settings", AgentController.default.updateSettings);
+
 // Agent
 router.get("/agent/profiles", AgentController.default.profiles);
 router.get("/agent/models", AgentController.default.models);
