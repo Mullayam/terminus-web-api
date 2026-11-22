@@ -35,6 +35,11 @@ export enum SocketEventConstants {
   SSH_EXEC_SILENT = "@@SSH_EXEC_SILENT",
   SSH_EXEC_SILENT_RESULT = "@@SSH_EXEC_SILENT_RESULT",
   SSH_EXEC_SILENT_OUTPUT = "@@SSH_EXEC_SILENT_OUTPUT",
+  /** Long-running exec (e.g. `docker logs -f`) streamed chunk by chunk. */
+  SSH_EXEC_STREAM = "@@SSH_EXEC_STREAM",
+  SSH_EXEC_STREAM_DATA = "@@SSH_EXEC_STREAM_DATA",
+  SSH_EXEC_STREAM_END = "@@SSH_EXEC_STREAM_END",
+  SSH_EXEC_STREAM_STOP = "@@SSH_EXEC_STREAM_STOP",
 
   /* ─── SFTP  (`/sftp` namespace) ───────────────────────────────────────── */
   SFTP_ENDED = "@@SFTP_ENDED",
