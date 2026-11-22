@@ -1,4 +1,5 @@
 import { EventEmitter } from "events";
+import { StringDecoder } from "string_decoder";
 import { Server, Socket } from "socket.io";
 import { Client, ClientChannel, ParsedKey } from "ssh2";
 import { RedisClientType } from "redis";
@@ -166,6 +167,7 @@ export class SocketListener extends EventEmitter {
         this.registerSSHResume(socket, sessionId);
         this.registerSSHStart(socket, sessionId);
         this.registerSilentExec(socket, sessionId);
+        this.registerStreamExec(socket, sessionId);
     }
 
     /** Session management: pause / kick / permissions */
@@ -356,6 +358,104 @@ export class SocketListener extends EventEmitter {
             stream.on("close", () => {
                 socket.emit(E.SSH_EXEC_SILENT_OUTPUT, { requestId, output });
             });
+        });
+    }
+
+    /**
+     * Streaming exec – for commands that never exit on their own (`docker logs -f`,
+     * `tail -f`, …). Output is pushed as it arrives instead of on close.
+     *
+     * Client emits:  SSH_EXEC_STREAM       { streamId, cmd }
+     *                SSH_EXEC_STREAM_STOP  { streamId }
+     * Server emits:  SSH_EXEC_STREAM_DATA  { streamId, chunk }
+     *                SSH_EXEC_STREAM_END   { streamId, code, error? }
+     *
+     * The channel gets a PTY so that closing it hangs up the remote process
+     * (SIGHUP) — without one, `docker logs -f` would linger on the server.
+     * Streams are scoped to this socket and torn down when it disconnects.
+     */
+    private registerStreamExec(socket: Socket, sessionId: string) {
+        const MAX_STREAMS = 8;
+        const FLUSH_MS = 50;
+        const streams = new Map<string, { ch?: ClientChannel; cancelled: boolean }>();
+
+        const stop = (streamId: string) => {
+            const entry = streams.get(streamId);
+            if (!entry) return;
+            streams.delete(streamId);
+            entry.cancelled = true;
+            if (!entry.ch) return; // exec still opening — the callback closes it
+            try { entry.ch.signal("INT"); } catch { /* not supported by every sshd */ }
+            try { entry.ch.close(); } catch { /* already closed */ }
+        };
+
+        socket.on(E.SSH_EXEC_STREAM, (payload?: { streamId?: string; cmd?: string }) => {
+            const streamId = payload?.streamId;
+            const cmd = payload?.cmd;
+            if (typeof streamId !== "string" || !streamId || typeof cmd !== "string" || !cmd) return;
+
+            const conn = this.sessions.get(sessionId);
+            if (!conn) {
+                socket.emit(E.SSH_EXEC_STREAM_END, { streamId, code: null, error: "No active SSH session" });
+                return;
+            }
+
+            stop(streamId); // restarting the same id replaces the old stream
+            if (streams.size >= MAX_STREAMS) {
+                socket.emit(E.SSH_EXEC_STREAM_END, { streamId, code: null, error: "Too many live streams open" });
+                return;
+            }
+
+            const entry: { ch?: ClientChannel; cancelled: boolean } = { cancelled: false };
+            streams.set(streamId, entry);
+
+            conn.exec(cmd, { pty: { term: "dumb", cols: 512, rows: 48 } }, (err, ch) => {
+                if (err) {
+                    if (streams.get(streamId) === entry) streams.delete(streamId);
+                    socket.emit(E.SSH_EXEC_STREAM_END, { streamId, code: null, error: err.message });
+                    return;
+                }
+                if (entry.cancelled || !socket.connected) {
+                    try { ch.close(); } catch { /* ignore */ }
+                    return;
+                }
+                entry.ch = ch;
+
+                // Batch small chunks so a chatty log doesn't flood the socket.
+                const decoder = new StringDecoder("utf8");
+                let buf = "";
+                let timer: NodeJS.Timeout | null = null;
+                const flush = () => {
+                    timer = null;
+                    if (!buf) return;
+                    socket.emit(E.SSH_EXEC_STREAM_DATA, { streamId, chunk: buf });
+                    buf = "";
+                };
+                const onData = (chunk: Buffer) => {
+                    buf += decoder.write(chunk);
+                    if (!timer) timer = setTimeout(flush, FLUSH_MS);
+                };
+
+                let code: number | null = null;
+                ch.on("exit", (c: number | null) => { code = typeof c === "number" ? c : null; });
+                ch.on("data", onData);
+                ch.stderr.on("data", onData);
+                ch.on("close", () => {
+                    if (timer) clearTimeout(timer);
+                    buf += decoder.end();
+                    flush();
+                    if (streams.get(streamId) === entry) streams.delete(streamId);
+                    socket.emit(E.SSH_EXEC_STREAM_END, { streamId, code });
+                });
+            });
+        });
+
+        socket.on(E.SSH_EXEC_STREAM_STOP, (payload?: { streamId?: string }) => {
+            if (typeof payload?.streamId === "string") stop(payload.streamId);
+        });
+
+        socket.on("disconnect", () => {
+            for (const id of [...streams.keys()]) stop(id);
         });
     }
 
